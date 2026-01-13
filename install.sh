@@ -100,8 +100,60 @@ maybe_use_ramroot() {
   fi
 }
 
+fix_system_after_overlay() {
+  # Only useful inside RAM-root overlay
+  [[ "${IN_RAMROOT:-0}" == "1" ]] || return 0
+
+  echo "• [ramroot] Fixing system state after overlay…"
+
+  # 1) Ensure pacman dirs exist
+  mkdir -p /var/lib/pacman /var/cache/pacman/pkg /etc/pacman.d
+
+  # 2) Ensure GNUPG dir is writable (overlay can make it weird)
+  #    Recreate it to guarantee it's in the upperdir (writable)
+  rm -rf /etc/pacman.d/gnupg
+  mkdir -p /etc/pacman.d/gnupg
+  chmod 700 /etc/pacman.d/gnupg
+
+  # 3) Make sure /tmp is writable (some archiso setups get funky)
+  mkdir -p /tmp
+  chmod 1777 /tmp
+
+  # 4) DNS: don't copy resolv.conf (often same file). Just ensure it exists.
+  if [[ ! -e /etc/resolv.conf ]]; then
+    echo "nameserver 1.1.1.1" > /etc/resolv.conf
+  fi
+
+  # 5) Initialize & populate pacman keyring (fixes "public keyring not found")
+  #    Do it idempotently: if already exists, keep it.
+  if [[ ! -f /etc/pacman.d/gnupg/pubring.kbx ]]; then
+    echo "• [ramroot] Initializing pacman-key…"
+    # Ensure enough entropy; on archiso it's usually fine, but this avoids stalls
+    (systemctl start haveged >/dev/null 2>&1 || true)
+    (systemctl start rngd >/dev/null 2>&1 || true)
+
+    pacman-key --init || true
+    pacman-key --populate archlinux || true
+  fi
+
+  # 6) If keyring package is missing/outdated, reinstall it (best-effort)
+  #    This can fix "required key missing from keyring" after overlay weirdness.
+  if ! pacman -Q archlinux-keyring >/dev/null 2>&1; then
+    echo "• [ramroot] Installing archlinux-keyring…"
+    pacman -Sy --noconfirm --needed archlinux-keyring || true
+    pacman-key --populate archlinux || true
+  fi
+
+  # 7) Sync DB sanity (best-effort)
+  pacman -Sy --noconfirm --needed archlinux-keyring >/dev/null 2>&1 || true
+
+  echo "• [ramroot] Done."
+}
+
+
 # Call this BEFORE installing live packages
 maybe_use_ramroot
+fix_system_after_overlay
 
 # ---- Live deps: MINIMAL (no big UI stacks in live!) ----
 pacman -Sy --noconfirm --needed \
