@@ -14,14 +14,52 @@ need(){ command -v "$1" >/dev/null 2>&1 || die "Missing: $1"; }
 need pacman
 need curl
 
+# size tuning (adjust if needed)
+mem_gb=$(awk '/MemTotal/ {printf "%.0f\n", $2/1024/1024}' /proc/meminfo)
+if (( mem_gb <= 4 )); then
+  export PACMAN_PKG_CACHE_SIZE=2G PACMAN_TMP_SIZE=2G PACMAN_SYNC_SIZE=256M
+elif (( mem_gb <= 8 )); then
+  export PACMAN_PKG_CACHE_SIZE=3G PACMAN_TMP_SIZE=3G PACMAN_SYNC_SIZE=512M
+else
+  export PACMAN_PKG_CACHE_SIZE=4G PACMAN_TMP_SIZE=4G PACMAN_SYNC_SIZE=768M
+fi
+
+# helper
+_mktmpfs() {
+  local mp="$1" size="$2"
+  mkdir -p "$mp"
+  mountpoint -q "$mp" || mount -t tmpfs -o "size=${size},mode=0755" tmpfs "$mp"
+}
+
+# 1) pacman package cache (downloads)
+_mktmpfs /run/drapbox-pacman-pkg "$PACMAN_PKG_CACHE_SIZE"
+mkdir -p /var/cache/pacman
+mountpoint -q /var/cache/pacman/pkg || mount --bind /run/drapbox-pacman-pkg /var/cache/pacman/pkg
+
+# 2) pacman sync DB cache (repo *.db files) -> keeps / from growing
+_mktmpfs /run/drapbox-pacman-sync "$PACMAN_SYNC_SIZE"
+mkdir -p /var/lib/pacman
+mkdir -p /var/lib/pacman/sync
+mountpoint -q /var/lib/pacman/sync || mount --bind /run/drapbox-pacman-sync /var/lib/pacman/sync
+
+# 3) temp dirs used during install/extract
+_mktmpfs /run/drapbox-tmp "$PACMAN_TMP_SIZE"
+mountpoint -q /tmp || mount --bind /run/drapbox-tmp /tmp
+
+_mktmpfs /run/drapbox-vartmp 1G
+mountpoint -q /var/tmp || mount --bind /run/drapbox-vartmp /var/tmp
+
+# 4) keep logs off airootfs too (optional but nice)
+mkdir -p /run/drapbox-logs
+mountpoint -q /var/log || mount --bind /run/drapbox-logs /var/log
+
 # ---- Live (RAM) deps: only what the installer needs ----
 # (No Waydroid/Miracast/UxPlay here; those go into the installed system via pacstrap)
 pacman -Sy --noconfirm --needed \
   sway foot xorg-xwayland \
   zenity \
-  networkmanager iwd \
-  gptfdisk util-linux dosfstools e2fsprogs btrfs-progs \
-  arch-install-scripts \
+  networkmanager \
+  util-linux btrfs-progs \
   gtk3 gtk-layer-shell python-gobject \
   gnome-themes-extra adwaita-icon-theme \
   >/dev/null
