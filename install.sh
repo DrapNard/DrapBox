@@ -13,38 +13,89 @@ need(){ command -v "$1" >/dev/null 2>&1 || die "Missing: $1"; }
 
 need pacman
 need curl
-
 # -------------------------------
-# ArchISO: reduce airootfs pressure
-# (keep only pacman cache + sync db off airootfs)
+# Auto RAM-root overlay (archiso cow space workaround)
+# - If / (airootfs) is too small, create an overlay root whose upper is tmpfs
+# - Then re-exec this script inside that merged root (chroot)
 # -------------------------------
-mem_gb=$(awk '/MemTotal/ {printf "%.0f\n", $2/1024/1024}' /proc/meminfo)
-if (( mem_gb <= 4 )); then
-  PACMAN_PKG_CACHE_SIZE=2G
-  PACMAN_SYNC_SIZE=256M
-elif (( mem_gb <= 8 )); then
-  PACMAN_PKG_CACHE_SIZE=3G
-  PACMAN_SYNC_SIZE=512M
-else
-  PACMAN_PKG_CACHE_SIZE=4G
-  PACMAN_SYNC_SIZE=768M
-fi
+IN_RAMROOT="${IN_RAMROOT:-0}"
 
-_mktmpfs() {
-  local mp="$1" size="$2"
-  mkdir -p "$mp"
-  mountpoint -q "$mp" || mount -t tmpfs -o "size=${size},mode=0755" tmpfs "$mp"
+root_free_mb() { df -Pm / | awk 'NR==2{print $4}'; }     # free MB on /
+ram_total_mb() { awk '/MemTotal/ {printf "%.0f\n", $2/1024}' /proc/meminfo; }
+
+enter_ramroot_overlay() {
+  local want_mb="$1"  # requested tmpfs size in MB
+
+  mkdir -p /run/drapbox-ramroot/{lower,merged,tmp}
+  mountpoint -q /run/drapbox-ramroot/lower  || mount --rbind / /run/drapbox-ramroot/lower
+  mount --make-rprivate /run/drapbox-ramroot/lower || true
+
+  # tmpfs that will host overlay upper/work (RAM)
+  mountpoint -q /run/drapbox-ramroot/tmp || mount -t tmpfs -o "size=${want_mb}M,mode=0755" tmpfs /run/drapbox-ramroot/tmp
+  mkdir -p /run/drapbox-ramroot/tmp/{upper,work}
+
+  # overlay mount
+  mountpoint -q /run/drapbox-ramroot/merged || mount -t overlay overlay \
+    -o "lowerdir=/run/drapbox-ramroot/lower,upperdir=/run/drapbox-ramroot/tmp/upper,workdir=/run/drapbox-ramroot/tmp/work" \
+    /run/drapbox-ramroot/merged
+
+  # essential bind mounts for a functional chroot
+  for d in proc sys dev run tmp; do
+    mkdir -p "/run/drapbox-ramroot/merged/$d"
+  done
+  mount --bind /proc /run/drapbox-ramroot/merged/proc
+  mount --bind /sys  /run/drapbox-ramroot/merged/sys
+  mount --bind /dev  /run/drapbox-ramroot/merged/dev
+  mount --bind /run  /run/drapbox-ramroot/merged/run
+  mount --bind /tmp  /run/drapbox-ramroot/merged/tmp
+
+  # DNS inside chroot
+  mkdir -p /run/drapbox-ramroot/merged/etc
+  cp -f /etc/resolv.conf /run/drapbox-ramroot/merged/etc/resolv.conf || true
+
+  # re-run script inside merged root
+  install -m 0755 "$0" /run/drapbox-ramroot/merged/tmp/drapbox-run
+
+  # pass DISPLAY if present (so zenity works)
+  local disp="${DISPLAY:-}"
+  local xauth="${XAUTHORITY:-}"
+
+  exec chroot /run/drapbox-ramroot/merged /bin/bash -lc \
+    "export IN_RAMROOT=1; \
+     [[ -n \"$disp\" ]] && export DISPLAY=\"$disp\"; \
+     [[ -n \"$xauth\" ]] && export XAUTHORITY=\"$xauth\"; \
+     /tmp/drapbox-run"
 }
 
-# pacman cache (downloads)
-_mktmpfs /run/drapbox-pacman-pkg "$PACMAN_PKG_CACHE_SIZE"
-mkdir -p /var/cache/pacman
-mountpoint -q /var/cache/pacman/pkg || mount --bind /run/drapbox-pacman-pkg /var/cache/pacman/pkg
+maybe_use_ramroot() {
+  (( IN_RAMROOT == 1 )) && return 0
 
-# pacman sync db (repo *.db)
-_mktmpfs /run/drapbox-pacman-sync "$PACMAN_SYNC_SIZE"
-mkdir -p /var/lib/pacman/sync
-mountpoint -q /var/lib/pacman/sync || mount --bind /run/drapbox-pacman-sync /var/lib/pacman/sync
+  local free_mb mem_mb
+  free_mb="$(root_free_mb)"
+  mem_mb="$(ram_total_mb)"
+
+  # threshold: if / has less than ~350MB free, pacman will likely explode on archiso
+  local threshold_mb=350
+
+  # need enough RAM to be worth it (keep headroom for wayland/xorg/pacman)
+  # choose tmpfs size dynamically: min(8192MB, (mem_mb - 2048MB)), but at least 2048MB
+  local want_mb=$(( mem_mb > 2048 ? mem_mb - 2048 : 0 ))
+  (( want_mb > 8192 )) && want_mb=8192
+  (( want_mb < 2048 )) && want_mb=0
+
+  if (( free_mb < threshold_mb )); then
+    if (( want_mb == 0 )); then
+      echo "✗ airootfs low (${free_mb}MB free) and not enough RAM for ramroot overlay."
+      echo "  Boot with: copytoram=y cow_spacesize=8G  (recommended) or use a machine with more RAM."
+      exit 1
+    fi
+    echo "• airootfs low (${free_mb}MB free). Switching to RAM-root overlay (${want_mb}MB)…"
+    enter_ramroot_overlay "$want_mb"
+  fi
+}
+
+# Call this BEFORE installing live packages
+maybe_use_ramroot
 
 # ---- Live deps: MINIMAL (no big UI stacks in live!) ----
 pacman -Sy --noconfirm --needed \
