@@ -15,6 +15,19 @@ need pacman
 need curl
 
 # =============================================================================
+# Logging (everything to file + still visible on screen)
+# =============================================================================
+LOG_DIR="/run/drapbox"
+mkdir -p "$LOG_DIR"
+LOG_FILE="${LOG_FILE:-$LOG_DIR/install-$(date +%Y%m%d-%H%M%S).log}"
+
+# Mirror stdout+stderr to log
+exec > >(tee -a "$LOG_FILE") 2>&1
+echo "=== DrapBox installer log: $LOG_FILE ==="
+echo "Started: $(date -Is)"
+echo
+
+# =============================================================================
 # Robust launcher + RAM-root overlay (works with bash <(curl ...))
 # =============================================================================
 SCRIPT_URL="${SCRIPT_URL:-https://raw.githubusercontent.com/DrapNard/DrapBox/refs/heads/main/install.sh}"
@@ -75,9 +88,19 @@ enter_ramroot_overlay() {
   mount --bind /run  /run/drapbox-ramroot/merged/run
   mount --bind /tmp  /run/drapbox-ramroot/merged/tmp
 
+  # Copy stable script + keep log path across chroot
   install -m 0755 "$SELF" /run/drapbox-ramroot/merged/tmp/drapbox-run
+  mkdir -p /run/drapbox-ramroot/merged/run/drapbox >/dev/null 2>&1 || true
+
   export IN_RAMROOT=1
-  exec chroot /run/drapbox-ramroot/merged /tmp/drapbox-run
+  export LOG_FILE="$LOG_FILE"
+  export LOG_DIR="$LOG_DIR"
+
+  exec chroot /run/drapbox-ramroot/merged /usr/bin/env -i \
+    PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+    IN_RAMROOT=1 LOG_FILE="$LOG_FILE" LOG_DIR="$LOG_DIR" \
+    SCRIPT_URL="$SCRIPT_URL" SELF="$SELF" \
+    /tmp/drapbox-run
 }
 
 maybe_use_ramroot() {
@@ -127,7 +150,7 @@ fix_system_after_overlay() {
 }
 
 # =============================================================================
-# CLI UI (whiptail) + network wizard
+# CLI UI (whiptail)
 # =============================================================================
 ensure_cli_ui() {
   if ! command -v whiptail >/dev/null 2>&1; then
@@ -136,7 +159,7 @@ ensure_cli_ui() {
   need whiptail
 }
 
-ui_msg(){ whiptail --title "$APP" --msgbox "$1" 12 78; }
+ui_msg(){ whiptail --title "$APP" --msgbox "$1\n\nLog: $LOG_FILE" 14 78; }
 ui_yesno(){ whiptail --title "$APP" --yesno "$1" 12 78; }
 ui_input(){ whiptail --title "$APP" --inputbox "$1" 12 78 "$2" 3>&1 1>&2 2>&3; }
 ui_pass(){ whiptail --title "$APP" --passwordbox "$1" 12 78 3>&1 1>&2 2>&3; }
@@ -198,9 +221,7 @@ pick_disk(){
   mapfile -t lines < <(lsblk -dnpo NAME,SIZE,MODEL,TYPE | awk '$4=="disk"{print $1 "|" $2 " " $3}')
   [[ ${#lines[@]} -gt 0 ]] || die "No disks found"
   local args=()
-  for l in "${lines[@]}"; do
-    args+=("${l%%|*}" "${l#*|}")
-  done
+  for l in "${lines[@]}"; do args+=("${l%%|*}" "${l#*|}"); done
   ui_menu "Select target disk (WILL BE WIPED):" "${args[@]}"
 }
 
@@ -282,9 +303,11 @@ HWACCEL="$(ui_menu "Waydroid video HW decode (VA-API):" \
 )" || die "No hwaccel choice"
 
 AUTOLOGIN="no"
-if ui_yesno "Appliance mode: autologin on TTY1 + auto-start Sway?"; then
-  AUTOLOGIN="yes"
-fi
+ui_yesno "Appliance mode: autologin on TTY1 + auto-start Sway?" && AUTOLOGIN="yes" || true
+
+# Auto reboot option
+AUTO_REBOOT="yes"
+ui_yesno "Auto reboot after install?\n\nYes = reboot automatically\nNo = drop to shell with logs path" && AUTO_REBOOT="yes" || AUTO_REBOOT="no"
 
 CONFIRM=$(
 cat <<EOF
@@ -302,6 +325,8 @@ Waydroid: $ATV_VARIANT
 Auto-switch: $AUTOSWITCH
 HW decode: $HWACCEL
 Autologin: $AUTOLOGIN
+
+Log file: $LOG_FILE
 
 Proceed?
 EOF
@@ -491,6 +516,19 @@ chmod +x "$MNT/root/drapbox-chroot.sh"
 arch-chroot "$MNT" /root/drapbox-chroot.sh \
   "$HOSTNAME" "$USERNAME" "$USERPASS" "$ROOTPASS" "$TZ" "$LOCALE" "$KEYMAP" "$AUTOLOGIN" "$FS"
 
-ui_msg "Install complete ✅\n\nSystem will reboot now."
+echo
+echo "✅ Install complete."
+echo "Log file: $LOG_FILE"
+echo
+
 umount -R "$MNT" >/dev/null 2>&1 || true
-reboot
+
+if [[ "$AUTO_REBOOT" == "yes" ]]; then
+  ui_msg "Install complete ✅\n\nRebooting now…"
+  reboot
+else
+  ui_msg "Install complete ✅\n\nAuto-reboot disabled.\n\nLog: $LOG_FILE\n\nDropping to shell."
+  echo "Auto-reboot disabled. Log: $LOG_FILE"
+  echo "You can copy it out (e.g. scp) or inspect here."
+  bash
+fi
