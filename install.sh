@@ -23,23 +23,15 @@ SCRIPT_URL="${SCRIPT_URL:-https://raw.githubusercontent.com/DrapNard/DrapBox/ref
 SELF="${SELF:-/run/drapbox-installer.sh}"
 
 _snapshot_self() {
-  if [[ -s "$SELF" ]]; then return 0; fi
+  [[ -s "$SELF" ]] && return 0
   mkdir -p "$(dirname "$SELF")"
 
-  # Try to read current script path
-  if [[ -r "${0:-}" && ! "$0" =~ ^/dev/fd/ ]]; then
+  # Try to read current script (may be /dev/fd/* when using bash <(curl ...))
+  if [[ -r "${0:-}" ]]; then
     cat "$0" > "$SELF" || true
   fi
 
-  # If launched via process substitution, $0 is /dev/fd/*
-  if [[ ! -s "$SELF" ]]; then
-    # Best effort: attempt to read from $0 anyway
-    if [[ -r "${0:-}" ]]; then
-      cat "$0" > "$SELF" || true
-    fi
-  fi
-
-  # Still empty? Re-download from URL
+  # Still empty? Re-download
   if [[ ! -s "$SELF" ]]; then
     curl -fsSL "$SCRIPT_URL" -o "$SELF"
   fi
@@ -49,11 +41,10 @@ _snapshot_self() {
 _snapshot_self
 
 # -------------------------------
-# Auto RAM-root overlay (archiso cow space workaround)
-# - If / (airootfs) is too small, create overlay root whose upper is tmpfs
-# - Then re-exec SELF inside that merged root (chroot)
+# RAM-root overlay (archiso cow space workaround)
 # -------------------------------
 IN_RAMROOT="${IN_RAMROOT:-0}"
+IN_X11="${IN_X11:-0}"
 
 root_free_mb() { df -Pm / | awk 'NR==2{print $4}'; }     # free MB on /
 ram_total_mb() { awk '/MemTotal/ {printf "%.0f\n", $2/1024}' /proc/meminfo; }
@@ -81,21 +72,21 @@ enter_ramroot_overlay() {
   mount --bind /run  /run/drapbox-ramroot/merged/run
   mount --bind /tmp  /run/drapbox-ramroot/merged/tmp
 
-  # Ensure pacman gnupg dir is definitely writable inside upperdir
+  # Ensure pacman gnupg dir is writable in upperdir
   mkdir -p /run/drapbox-ramroot/merged/etc/pacman.d
   rm -rf /run/drapbox-ramroot/merged/etc/pacman.d/gnupg
   mkdir -p /run/drapbox-ramroot/merged/etc/pacman.d/gnupg
   chmod 700 /run/drapbox-ramroot/merged/etc/pacman.d/gnupg
 
-  # Re-run stable script inside merged root
   install -m 0755 "$SELF" /run/drapbox-ramroot/merged/tmp/drapbox-run
 
-  # Pass DISPLAY/XAUTHORITY if already in X
   local disp="${DISPLAY:-}"
   local xauth="${XAUTHORITY:-}"
 
+  # IMPORTANT: do not use "bash -lc" (it can break function availability / env)
   exec chroot /run/drapbox-ramroot/merged /usr/bin/env bash -c \
     "export IN_RAMROOT=1; \
+     export IN_X11=${IN_X11}; \
      [[ -n \"$disp\" ]] && export DISPLAY=\"$disp\"; \
      [[ -n \"$xauth\" ]] && export XAUTHORITY=\"$xauth\"; \
      exec /usr/bin/env bash /tmp/drapbox-run"
@@ -143,32 +134,29 @@ fix_system_after_overlay() {
 
   [[ -e /etc/resolv.conf ]] || echo "nameserver 1.1.1.1" > /etc/resolv.conf
 
-  # Keyring init (overlay breaks writability)
   (systemctl start haveged >/dev/null 2>&1 || true)
   (systemctl start rngd >/dev/null 2>&1 || true)
+
   pacman-key --init >/dev/null 2>&1 || true
   pacman-key --populate archlinux >/dev/null 2>&1 || true
 
   echo "• [ramroot] Done."
 }
 
-# Start network early (before checks)
+# Start network early
 systemctl start iwd >/dev/null 2>&1 || true
 systemctl start NetworkManager >/dev/null 2>&1 || true
 
-# Switch to RAM overlay if needed, then fix state inside overlay
+# Overlay if needed, then fix state
 maybe_use_ramroot
 fix_system_after_overlay
 
-# -------------------------------
-# Pacman safety: always ensure keyring usable before big installs
-# -------------------------------
+# Keep pacman keyring sane (idempotent)
 pacman -Sy --noconfirm --needed archlinux-keyring >/dev/null 2>&1 || true
 pacman-key --populate archlinux >/dev/null 2>&1 || true
 
 # -------------------------------
-# ArchISO: reduce airootfs pressure
-# (keep pacman cache + sync db off airootfs)
+# ArchISO: reduce airootfs pressure (pacman cache + sync db in tmpfs)
 # -------------------------------
 mem_gb=$(awk '/MemTotal/ {printf "%.0f\n", $2/1024/1024}' /proc/meminfo)
 if (( mem_gb <= 4 )); then
@@ -231,12 +219,15 @@ need arch-chroot
 need genfstab
 
 # ---- Relaunch inside X11 (Openbox) if not already ----
-if [[ -z "${DISPLAY:-}" ]]; then
+if [[ -z "${DISPLAY:-}" && "${IN_X11:-0}" != "1" ]]; then
+  export IN_X11=1
+
   cat >/tmp/drapbox-xinitrc <<'EOF'
 xsetroot -solid "#0b0b0b"
 openbox-session &
-exec xterm -fa "Monospace" -fs 12 -e /usr/bin/env bash -lc "/tmp/drapbox-run"
+exec xterm -fa "Monospace" -fs 12 -e /usr/bin/env bash /tmp/drapbox-run
 EOF
+
   cp "$SELF" /tmp/drapbox-run
   chmod +x /tmp/drapbox-run
   exec startx /tmp/drapbox-xinitrc -- :0
@@ -600,7 +591,6 @@ gtk-application-prefer-dark-theme=1
 EOF
 chown "$USERNAME:$USERNAME" "$UHOME/.config/gtk-3.0/settings.ini"
 
-# NOTE: Keep your existing overlay/uxplayd/miracastd/host-actions/firstboot/autologin code here unchanged.
 CHROOT
 
 chmod +x "$MNT/root/drapbox-chroot.sh"
@@ -613,21 +603,6 @@ p 100 "Done."
 sleep 1
 
 zinfo "Install complete ✅
-
-Bluetooth:
-- Enabled (bluetooth.service)
-
-Casting:
-- AirPlay (always-on) name = hostname ($HOSTNAME)
-- Miracast (always-on)
-- Auto-switch: $AUTOSWITCH
-
-Host Actions:
-- http://localhost:9876/tv
-
-Waydroid AndroidTV:
-- $ATV_VARIANT
-- HW decode: $HWACCEL
 
 Rebooting now…"
 reboot
