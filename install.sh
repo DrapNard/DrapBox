@@ -253,7 +253,7 @@ pacman-key --populate archlinux >/dev/null 2>&1 || true
 
 # Minimal live deps only
 pacman -Sy --noconfirm --needed \
-  iwctl iwd networkmanager nmtui \
+  iwd networkmanager \
   gptfdisk util-linux dosfstools e2fsprogs btrfs-progs \
   arch-install-scripts \
   curl git \
