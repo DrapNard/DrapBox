@@ -74,22 +74,28 @@ maybe_use_ramroot() {
   free_mb="$(root_free_mb)"
   mem_mb="$(ram_total_mb)"
 
-  # threshold: if / has less than ~350MB free, pacman will likely explode on archiso
+  # If / is tight, archiso overlay will explode during pacman.
   local threshold_mb=350
 
-  # need enough RAM to be worth it (keep headroom for wayland/xorg/pacman)
-  # choose tmpfs size dynamically: min(8192MB, (mem_mb - 2048MB)), but at least 2048MB
-  local want_mb=$(( mem_mb > 2048 ? mem_mb - 2048 : 0 ))
-  (( want_mb > 8192 )) && want_mb=8192
-  (( want_mb < 2048 )) && want_mb=0
+  # Force strategy (works down to 4GB RAM):
+  # - 4GB RAM  -> ~1024MB overlay
+  # - 6GB RAM  -> ~1536MB overlay
+  # - 8GB+ RAM -> up to 8192MB overlay
+  local want_mb
+  if   (( mem_mb <= 4096 )); then
+    want_mb=1024
+  elif (( mem_mb <= 6144 )); then
+    want_mb=1536
+  elif (( mem_mb <= 8192 )); then
+    want_mb=2048
+  else
+    want_mb=$(( mem_mb - 2048 ))
+    (( want_mb > 8192 )) && want_mb=8192
+  fi
 
   if (( free_mb < threshold_mb )); then
-    if (( want_mb == 0 )); then
-      echo "✗ airootfs low (${free_mb}MB free) and not enough RAM for ramroot overlay."
-      echo "  Boot with: copytoram=y cow_spacesize=8G  (recommended) or use a machine with more RAM."
-      exit 1
-    fi
-    echo "• airootfs low (${free_mb}MB free). Switching to RAM-root overlay (${want_mb}MB)…"
+    echo "⚠ airootfs low (${free_mb}MB free). FORCING RAM-root overlay (${want_mb}MB)."
+    echo "  (Low-RAM mode: may be slower/unstable if you install big live deps.)"
     enter_ramroot_overlay "$want_mb"
   fi
 }
