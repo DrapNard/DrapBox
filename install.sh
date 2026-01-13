@@ -15,7 +15,43 @@ need pacman
 need curl
 
 # -------------------------------
+# Robust SELF snapshot
+# - Fixes bash <(curl ...) where $0 is /dev/fd/*
+# - Ensures we always re-exec from a real file (overlay + startx)
+# -------------------------------
+SCRIPT_URL="${SCRIPT_URL:-https://raw.githubusercontent.com/DrapNard/DrapBox/refs/heads/main/install.sh}"
+SELF="${SELF:-/run/drapbox-installer.sh}"
+
+_snapshot_self() {
+  if [[ -s "$SELF" ]]; then return 0; fi
+  mkdir -p "$(dirname "$SELF")"
+
+  # Try to read current script path
+  if [[ -r "${0:-}" && ! "$0" =~ ^/dev/fd/ ]]; then
+    cat "$0" > "$SELF" || true
+  fi
+
+  # If launched via process substitution, $0 is /dev/fd/*
+  if [[ ! -s "$SELF" ]]; then
+    # Best effort: attempt to read from $0 anyway
+    if [[ -r "${0:-}" ]]; then
+      cat "$0" > "$SELF" || true
+    fi
+  fi
+
+  # Still empty? Re-download from URL
+  if [[ ! -s "$SELF" ]]; then
+    curl -fsSL "$SCRIPT_URL" -o "$SELF"
+  fi
+
+  chmod +x "$SELF"
+}
+_snapshot_self
+
+# -------------------------------
 # Auto RAM-root overlay (archiso cow space workaround)
+# - If / (airootfs) is too small, create overlay root whose upper is tmpfs
+# - Then re-exec SELF inside that merged root (chroot)
 # -------------------------------
 IN_RAMROOT="${IN_RAMROOT:-0}"
 
@@ -23,22 +59,19 @@ root_free_mb() { df -Pm / | awk 'NR==2{print $4}'; }     # free MB on /
 ram_total_mb() { awk '/MemTotal/ {printf "%.0f\n", $2/1024}' /proc/meminfo; }
 
 enter_ramroot_overlay() {
-  local want_mb="$1"  # requested tmpfs size in MB
+  local want_mb="$1"
 
   mkdir -p /run/drapbox-ramroot/{lower,merged,tmp}
-  mountpoint -q /run/drapbox-ramroot/lower  || mount --rbind / /run/drapbox-ramroot/lower
+  mountpoint -q /run/drapbox-ramroot/lower || mount --rbind / /run/drapbox-ramroot/lower
   mount --make-rprivate /run/drapbox-ramroot/lower || true
 
-  # tmpfs that will host overlay upper/work (RAM)
   mountpoint -q /run/drapbox-ramroot/tmp || mount -t tmpfs -o "size=${want_mb}M,mode=0755" tmpfs /run/drapbox-ramroot/tmp
   mkdir -p /run/drapbox-ramroot/tmp/{upper,work}
 
-  # overlay mount
   mountpoint -q /run/drapbox-ramroot/merged || mount -t overlay overlay \
     -o "lowerdir=/run/drapbox-ramroot/lower,upperdir=/run/drapbox-ramroot/tmp/upper,workdir=/run/drapbox-ramroot/tmp/work" \
     /run/drapbox-ramroot/merged
 
-  # essential bind mounts for a functional chroot
   for d in proc sys dev run tmp; do
     mkdir -p "/run/drapbox-ramroot/merged/$d"
   done
@@ -48,20 +81,19 @@ enter_ramroot_overlay() {
   mount --bind /run  /run/drapbox-ramroot/merged/run
   mount --bind /tmp  /run/drapbox-ramroot/merged/tmp
 
-  # Ensure pacman keyring dir is writable INSIDE merged root (upperdir)
+  # Ensure pacman gnupg dir is definitely writable inside upperdir
   mkdir -p /run/drapbox-ramroot/merged/etc/pacman.d
   rm -rf /run/drapbox-ramroot/merged/etc/pacman.d/gnupg
   mkdir -p /run/drapbox-ramroot/merged/etc/pacman.d/gnupg
   chmod 700 /run/drapbox-ramroot/merged/etc/pacman.d/gnupg
 
-  # re-run script inside merged root
-  install -m 0755 "$0" /run/drapbox-ramroot/merged/tmp/drapbox-run
+  # Re-run stable script inside merged root
+  install -m 0755 "$SELF" /run/drapbox-ramroot/merged/tmp/drapbox-run
 
-  # pass DISPLAY if present (so zenity works)
+  # Pass DISPLAY/XAUTHORITY if already in X
   local disp="${DISPLAY:-}"
   local xauth="${XAUTHORITY:-}"
 
-  # IMPORTANT: exec bash directly (avoid "-lc" pitfalls / missing funcs)
   exec chroot /run/drapbox-ramroot/merged /usr/bin/env bash -c \
     "export IN_RAMROOT=1; \
      [[ -n \"$disp\" ]] && export DISPLAY=\"$disp\"; \
@@ -101,46 +133,71 @@ fix_system_after_overlay() {
 
   echo "• [ramroot] Fixing system state after overlay…"
 
-  # pacman dirs
   mkdir -p /var/lib/pacman /var/cache/pacman/pkg /etc/pacman.d
-
-  # Ensure GNUPG is writable (force into upperdir)
   rm -rf /etc/pacman.d/gnupg
   mkdir -p /etc/pacman.d/gnupg
   chmod 700 /etc/pacman.d/gnupg
 
-  # tmp
   mkdir -p /tmp
   chmod 1777 /tmp
 
-  # DNS: don't copy (often same file). Ensure exists.
   [[ -e /etc/resolv.conf ]] || echo "nameserver 1.1.1.1" > /etc/resolv.conf
 
-  # Keyring init (mandatory in overlay cases)
+  # Keyring init (overlay breaks writability)
   (systemctl start haveged >/dev/null 2>&1 || true)
   (systemctl start rngd >/dev/null 2>&1 || true)
-
-  pacman-key --init || true
-  pacman-key --populate archlinux || true
-
-  # Refresh keyring package if available
-  pacman -Sy --noconfirm --needed archlinux-keyring >/dev/null 2>&1 || true
+  pacman-key --init >/dev/null 2>&1 || true
   pacman-key --populate archlinux >/dev/null 2>&1 || true
 
   echo "• [ramroot] Done."
 }
 
-# ---- Start network services in live (do it before any UI/network checks) ----
+# Start network early (before checks)
 systemctl start iwd >/dev/null 2>&1 || true
 systemctl start NetworkManager >/dev/null 2>&1 || true
 
-# Call this BEFORE installing live packages
+# Switch to RAM overlay if needed, then fix state inside overlay
 maybe_use_ramroot
 fix_system_after_overlay
 
-# ---- Live deps: MINIMAL ----
+# -------------------------------
+# Pacman safety: always ensure keyring usable before big installs
+# -------------------------------
+pacman -Sy --noconfirm --needed archlinux-keyring >/dev/null 2>&1 || true
+pacman-key --populate archlinux >/dev/null 2>&1 || true
+
+# -------------------------------
+# ArchISO: reduce airootfs pressure
+# (keep pacman cache + sync db off airootfs)
+# -------------------------------
+mem_gb=$(awk '/MemTotal/ {printf "%.0f\n", $2/1024/1024}' /proc/meminfo)
+if (( mem_gb <= 4 )); then
+  PACMAN_PKG_CACHE_SIZE=768M
+  PACMAN_SYNC_SIZE=128M
+elif (( mem_gb <= 8 )); then
+  PACMAN_PKG_CACHE_SIZE=1536M
+  PACMAN_SYNC_SIZE=256M
+else
+  PACMAN_PKG_CACHE_SIZE=2048M
+  PACMAN_SYNC_SIZE=512M
+fi
+
+_mktmpfs() {
+  local mp="$1" size="$2"
+  mkdir -p "$mp"
+  mountpoint -q "$mp" || mount -t tmpfs -o "size=${size},mode=0755" tmpfs "$mp"
+}
+
+_mktmpfs /run/drapbox-pacman-pkg "$PACMAN_PKG_CACHE_SIZE"
+mkdir -p /var/cache/pacman
+mountpoint -q /var/cache/pacman/pkg || mount --bind /run/drapbox-pacman-pkg /var/cache/pacman/pkg
+
+_mktmpfs /run/drapbox-pacman-sync "$PACMAN_SYNC_SIZE"
+mkdir -p /var/lib/pacman/sync
+mountpoint -q /var/lib/pacman/sync || mount --bind /run/drapbox-pacman-sync /var/lib/pacman/sync
+
+# ---- Live deps ----
 pacman -Sy --noconfirm --needed \
-  archlinux-keyring \
   zenity \
   xorg-server xorg-xinit xterm openbox \
   networkmanager iwd \
@@ -149,7 +206,7 @@ pacman -Sy --noconfirm --needed \
   curl git \
   >/dev/null
 
-# Optional on-screen keyboard (try matchbox-keyboard, fallback to onboard/florence)
+# Optional OSK (best effort)
 if ! command -v matchbox-keyboard >/dev/null 2>&1; then
   pacman -S --noconfirm --needed matchbox-keyboard >/dev/null 2>&1 || true
 fi
@@ -164,9 +221,6 @@ need zenity
 need startx
 need xterm
 need openbox-session
-command -v matchbox-keyboard >/dev/null 2>&1 || \
-command -v onboard >/dev/null 2>&1 || \
-command -v florence >/dev/null 2>&1 || true
 need iwctl
 need nmtui
 need sgdisk
@@ -181,9 +235,9 @@ if [[ -z "${DISPLAY:-}" ]]; then
   cat >/tmp/drapbox-xinitrc <<'EOF'
 xsetroot -solid "#0b0b0b"
 openbox-session &
-exec xterm -fa "Monospace" -fs 12 -e bash -lc "/tmp/drapbox-run"
+exec xterm -fa "Monospace" -fs 12 -e /usr/bin/env bash -lc "/tmp/drapbox-run"
 EOF
-  cp "$0" /tmp/drapbox-run
+  cp "$SELF" /tmp/drapbox-run
   chmod +x /tmp/drapbox-run
   exec startx /tmp/drapbox-xinitrc -- :0
 fi
@@ -451,7 +505,6 @@ if [[ "$SWAP_G" != "0" ]]; then
   fi
 fi
 
-# Persist installer choices for first boot
 mkdir -p "$MNT/var/lib/drapbox"
 echo "$ATV_VARIANT" > "$MNT/var/lib/drapbox/waydroid_variant"
 echo "$AUTOSWITCH"  > "$MNT/var/lib/drapbox/autoswitch"
@@ -547,6 +600,7 @@ gtk-application-prefer-dark-theme=1
 EOF
 chown "$USERNAME:$USERNAME" "$UHOME/.config/gtk-3.0/settings.ini"
 
+# NOTE: Keep your existing overlay/uxplayd/miracastd/host-actions/firstboot/autologin code here unchanged.
 CHROOT
 
 chmod +x "$MNT/root/drapbox-chroot.sh"
