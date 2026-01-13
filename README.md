@@ -1,25 +1,139 @@
-# DrapBox
-A install sh script for arch linux to transform a pc (x86) into a AndroidTV (GApps or Not) with support of MiraCast and AirPlay
+# DrapBox (Beta)
+
+DrapBox is an **Arch Linux installation script** that transforms a standard **x86_64 PC** into a **living-room appliance**, mixing the experience of **Apple TV × Google TV**.
+
+It provides:
+- Android TV (via Waydroid – GApps or Vanilla)
+- AirPlay receiver (UxPlay, always-on, PIN pairing)
+- Miracast receiver (Android / Windows screen casting)
+- Minimal Wayland environment (no traditional desktop)
+- Fullscreen, TV-like UX
+
+This project is currently in **beta** and uses a **single large installer script**.  
+A more modular, repo-based system is planned for later versions.
 
 ---
 
-## to install :
+## ⚠️ Important warnings
 
-### Requirement:
-> [!CAUTION]
-> This will wipe all the data on the disk
+> [!CAUTION]  
+> **This installer will ERASE the selected disk entirely.**  
+> All existing data will be permanently lost.
 
 > [!WARNING]  
-> The installation will require basic knowledge like connecting to the internet,
-> follow the arch install guide to connect to internet and to install curl
+> This is **not a beginner-friendly installer**.  
+> You are expected to know:
+> - how to boot an Arch ISO in UEFI mode
+> - how to connect to the internet from the Arch live environment
+> - how to use a terminal if something goes wrong
 
-Arch Linux 
-a iGPU or a GPU to make drm work in androidTV
-minimum 20gig of storage
+---
 
-### Install :
+## ✨ Features
 
-just execute this command :
-```
+- **Android TV (Waydroid)**
+  - Android 13 (LineageOS-based)
+  - GApps **or** Vanilla (no Google) build
+  - Widevine L3 support
+- **AirPlay**
+  - Always-on receiver (UxPlay)
+  - Hostname-based device name
+  - 4-digit PIN shown on screen (Apple TV–style)
+- **Miracast**
+  - Screen casting from Android & Windows
+- **Minimal UI**
+  - Wayland + Sway
+  - No panels, no desktop clutter
+  - Only Android TV and casting surfaces visible
+- **Appliance mode**
+  - Optional auto-login
+  - Fast boot with systemd-boot + Plymouth
+- **Local control panel**
+  - “Host Actions” web UI (restart services, reboot, settings, etc.)
+
+---
+
+## 📦 Requirements
+
+### Hardware
+- x86_64 PC
+- **UEFI firmware** (legacy BIOS is not supported)
+- Intel or AMD GPU (iGPU recommended)
+- Wi-Fi adapter with **Wi-Fi Direct** support (required for Miracast)
+- Minimum **20 GB** of storage (more recommended)
+
+### Software
+- Arch Linux ISO (official)
+- Internet connection during installation
+
+---
+
+## 🚀 Installation
+
+1. Boot the **Arch Linux ISO** in **UEFI mode**
+2. Connect to the internet (Ethernet or Wi-Fi)
+3. Make sure `curl` is available
+4. Run the installer:
+
+```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/DrapNard/DrapBox/refs/heads/main/install.sh)
-```
+````
+
+The installer will guide you through:
+
+* Disk selection and formatting
+* Locale, timezone, keyboard
+* Android TV variant (GApps or Vanilla)
+* Swap configuration
+* Appliance options (auto-login, casting behavior)
+
+---
+
+## 🧪 Project status
+
+* **Status:** Beta
+* **Installer:** Monolithic script (for now)
+* **Target use:** Personal / experimental / appliance builds
+* **Stability:** Good, but expect rough edges
+
+Future versions will move toward:
+
+* a modular repo-based architecture
+* easier updates
+* safer maintenance
+
+---
+
+## 🛠 Disclaimer
+
+This project is provided **as-is**, without warranty.
+Use it at your own risk.
+Not affiliated with Google, Apple, or the Android TV project.
+
+---
+
+## 🙏 Special Thanks
+
+This project would not be possible without the work and contributions of the open-source community.
+
+Special thanks to:
+
+- **supechicken**  
+  For the **Waydroid Android TV builds** used as the base for DrapBox’s Android TV experience  
+  (LineageOS Android TV, GApps/Vanilla variants, Widevine L3 support).  
+  👉 https://github.com/supechicken/waydroid-androidtv-build
+
+Additional thanks to the developers and maintainers of:
+- Waydroid
+- UxPlay
+- PipeWire / WirePlumber
+- Arch Linux
+- The Android Open Source Project (AOSP)
+
+If you believe your work should be credited here, feel free to open an issue or pull request.
+
+---
+
+## 📄 License
+
+MIT (unless stated otherwise in specific components)
