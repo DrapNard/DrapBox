@@ -48,20 +48,34 @@ mountpoint -q /var/lib/pacman/sync || mount --bind /run/drapbox-pacman-sync /var
 
 # ---- Live deps: MINIMAL (no big UI stacks in live!) ----
 pacman -Sy --noconfirm --needed \
+  archlinux-keyring \
   zenity \
   xorg-server xorg-xinit xterm openbox \
-  matchbox-keyboard \
-  networkmanager iwd iwctl nmtui \
+  networkmanager iwd \
   gptfdisk util-linux dosfstools e2fsprogs btrfs-progs \
   arch-install-scripts \
   curl git \
   >/dev/null
 
+# Optional on-screen keyboard (try matchbox-keyboard, fallback to onboard/florence)
+if ! command -v matchbox-keyboard >/dev/null 2>&1; then
+  pacman -S --noconfirm --needed matchbox-keyboard >/dev/null 2>&1 || true
+fi
+if ! command -v matchbox-keyboard >/dev/null 2>&1; then
+  pacman -S --noconfirm --needed onboard >/dev/null 2>&1 || true
+fi
+if ! command -v matchbox-keyboard >/dev/null 2>&1 && ! command -v onboard >/dev/null 2>&1; then
+  pacman -S --noconfirm --needed florence >/dev/null 2>&1 || true
+fi
+
+
 need zenity
 need startx
 need xterm
 need openbox-session
-need matchbox-keyboard
+command -v matchbox-keyboard >/dev/null 2>&1 || \
+command -v onboard >/dev/null 2>&1 || \
+command -v florence >/dev/null 2>&1 || true
 need iwctl
 need nmtui
 need sgdisk
@@ -97,8 +111,20 @@ zlist(){ zenity --list --title "$1" --width=980 --height=560 --column="$2" --col
 
 start_osk(){
   pkill -f matchbox-keyboard >/dev/null 2>&1 || true
-  (matchbox-keyboard >/dev/null 2>&1 &) || true
+  pkill -f onboard >/dev/null 2>&1 || true
+  pkill -f florence >/dev/null 2>&1 || true
+
+  if command -v matchbox-keyboard >/dev/null 2>&1; then
+    (matchbox-keyboard >/dev/null 2>&1 &) || true
+  elif command -v onboard >/dev/null 2>&1; then
+    (onboard >/dev/null 2>&1 &) || true
+  elif command -v florence >/dev/null 2>&1; then
+    (florence >/dev/null 2>&1 &) || true
+  else
+    zerr "No on-screen keyboard available (matchbox-keyboard/onboard/florence not installed)."
+  fi
 }
+
 
 is_online(){
   ping -c1 -W1 1.1.1.1 >/dev/null 2>&1 && return 0
