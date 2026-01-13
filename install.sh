@@ -224,7 +224,7 @@ mountpoint -q /var/lib/pacman/sync || mount --bind /run/drapbox-pacman-sync /var
 pacman -Sy --noconfirm --needed \
   zenity \
   xorg-server xorg-xinit xterm openbox \
-  networkmanager iwd iwctl nmtui \
+  networkmanager \
   gptfdisk util-linux dosfstools e2fsprogs btrfs-progs \
   arch-install-scripts \
   curl git \
