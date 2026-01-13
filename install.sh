@@ -14,24 +14,29 @@ need(){ command -v "$1" >/dev/null 2>&1 || die "Missing: $1"; }
 need pacman
 need curl
 
-# -------------------------------
-# Robust SELF snapshot
-# - Fixes bash <(curl ...) where $0 is /dev/fd/*
-# - Ensures we always re-exec from a real file (overlay + startx)
-# -------------------------------
+# =============================================================================
+# Robust launcher layer
+# - Fixes "bash <(curl ...)" ($0 = /dev/fd/*) by snapshotting to a real file.
+# - Adds RAM-root overlay auto-switch with:
+#   * skip when already in overlay
+#   * cleanup if previous run left half-mounted state
+# - Fixes keyring/pacman writability inside overlay
+# - Fixes X relaunch loop + avoids bash -lc (which breaks functions)
+# =============================================================================
+
 SCRIPT_URL="${SCRIPT_URL:-https://raw.githubusercontent.com/DrapNard/DrapBox/refs/heads/main/install.sh}"
 SELF="${SELF:-/run/drapbox-installer.sh}"
 
 _snapshot_self() {
-  [[ -s "$SELF" ]] && return 0
   mkdir -p "$(dirname "$SELF")"
+  [[ -s "$SELF" ]] && return 0
 
-  # Try to read current script (may be /dev/fd/* when using bash <(curl ...))
+  # Best-effort: read the currently executing script (even if /dev/fd/*)
   if [[ -r "${0:-}" ]]; then
-    cat "$0" > "$SELF" || true
+    cat "$0" > "$SELF" 2>/dev/null || true
   fi
 
-  # Still empty? Re-download
+  # Still empty? Re-download.
   if [[ ! -s "$SELF" ]]; then
     curl -fsSL "$SCRIPT_URL" -o "$SELF"
   fi
@@ -40,19 +45,54 @@ _snapshot_self() {
 }
 _snapshot_self
 
-# -------------------------------
-# RAM-root overlay (archiso cow space workaround)
-# -------------------------------
+# Overlay flags
 IN_RAMROOT="${IN_RAMROOT:-0}"
 IN_X11="${IN_X11:-0}"
 
 root_free_mb() { df -Pm / | awk 'NR==2{print $4}'; }     # free MB on /
 ram_total_mb() { awk '/MemTotal/ {printf "%.0f\n", $2/1024}' /proc/meminfo; }
 
+is_drapbox_ramroot_active() {
+  # If env says yes
+  [[ "${IN_RAMROOT:-0}" == "1" ]] && return 0
+
+  # If / is overlay AND drapbox ramroot mounts exist
+  local fst
+  fst="$(findmnt -n -o FSTYPE / 2>/dev/null || true)"
+  if [[ "$fst" == "overlay" ]] && grep -q "/run/drapbox-ramroot" /proc/mounts 2>/dev/null; then
+    return 0
+  fi
+  return 1
+}
+
+mark_ramroot_if_detected() {
+  if is_drapbox_ramroot_active; then
+    export IN_RAMROOT=1
+  fi
+}
+
+cleanup_ramroot_state() {
+  # Best-effort cleanup if previous run left junk
+  umount -R /run/drapbox-ramroot/merged >/dev/null 2>&1 || true
+  umount -R /run/drapbox-ramroot/lower  >/dev/null 2>&1 || true
+  umount -R /run/drapbox-ramroot/tmp    >/dev/null 2>&1 || true
+  rm -rf /run/drapbox-ramroot >/dev/null 2>&1 || true
+}
+
 enter_ramroot_overlay() {
   local want_mb="$1"
 
+  # If already active, skip
+  mark_ramroot_if_detected
+  (( IN_RAMROOT == 1 )) && return 0
+
+  # If previous run created dir but mounts are inconsistent, reset
+  if [[ -e /run/drapbox-ramroot ]] && ! mountpoint -q /run/drapbox-ramroot/merged 2>/dev/null; then
+    cleanup_ramroot_state
+  fi
+
   mkdir -p /run/drapbox-ramroot/{lower,merged,tmp}
+
   mountpoint -q /run/drapbox-ramroot/lower || mount --rbind / /run/drapbox-ramroot/lower
   mount --make-rprivate /run/drapbox-ramroot/lower || true
 
@@ -78,12 +118,13 @@ enter_ramroot_overlay() {
   mkdir -p /run/drapbox-ramroot/merged/etc/pacman.d/gnupg
   chmod 700 /run/drapbox-ramroot/merged/etc/pacman.d/gnupg
 
+  # Install a stable copy of the script inside the merged root
   install -m 0755 "$SELF" /run/drapbox-ramroot/merged/tmp/drapbox-run
 
   local disp="${DISPLAY:-}"
   local xauth="${XAUTHORITY:-}"
 
-  # IMPORTANT: do not use "bash -lc" (it can break function availability / env)
+  # IMPORTANT: never bash -lc; keep execution simple/stable
   exec chroot /run/drapbox-ramroot/merged /usr/bin/env bash -c \
     "export IN_RAMROOT=1; \
      export IN_X11=${IN_X11}; \
@@ -93,7 +134,14 @@ enter_ramroot_overlay() {
 }
 
 maybe_use_ramroot() {
+  mark_ramroot_if_detected
   (( IN_RAMROOT == 1 )) && return 0
+
+  # If mounts already exist from previous run, just mark and continue
+  if mountpoint -q /run/drapbox-ramroot/merged 2>/dev/null; then
+    export IN_RAMROOT=1
+    return 0
+  fi
 
   local free_mb mem_mb
   free_mb="$(root_free_mb)"
@@ -115,6 +163,7 @@ maybe_use_ramroot() {
 
   if (( free_mb < threshold_mb )); then
     echo "⚠ airootfs low (${free_mb}MB free). FORCING RAM-root overlay (${want_mb}MB)."
+    echo "  (If you reboot and rerun, it will skip overlay if already active.)"
     enter_ramroot_overlay "$want_mb"
   fi
 }
@@ -143,11 +192,14 @@ fix_system_after_overlay() {
   echo "• [ramroot] Done."
 }
 
-# Start network early
+# Start network early (safe)
 systemctl start iwd >/dev/null 2>&1 || true
 systemctl start NetworkManager >/dev/null 2>&1 || true
 
-# Overlay if needed, then fix state
+# If already in overlay (rerun), skip overlay logic automatically
+mark_ramroot_if_detected
+
+# Switch to overlay if needed, then fix state inside overlay
 maybe_use_ramroot
 fix_system_after_overlay
 
@@ -184,7 +236,7 @@ _mktmpfs /run/drapbox-pacman-sync "$PACMAN_SYNC_SIZE"
 mkdir -p /var/lib/pacman/sync
 mountpoint -q /var/lib/pacman/sync || mount --bind /run/drapbox-pacman-sync /var/lib/pacman/sync
 
-# ---- Live deps ----
+# ---- Live deps (keep minimal) ----
 pacman -Sy --noconfirm --needed \
   zenity \
   xorg-server xorg-xinit xterm openbox \
@@ -222,14 +274,22 @@ need genfstab
 if [[ -z "${DISPLAY:-}" && "${IN_X11:-0}" != "1" ]]; then
   export IN_X11=1
 
+  # Build a stable runner for X11 relaunch (never rely on $0)
+  if [[ -s "$SELF" ]]; then
+    cp "$SELF" /tmp/drapbox-run
+  elif [[ -r "${0:-}" && ! "$0" =~ ^/dev/fd/ ]]; then
+    cp "$0" /tmp/drapbox-run
+  else
+    curl -fsSL "$SCRIPT_URL" -o /tmp/drapbox-run
+  fi
+  chmod +x /tmp/drapbox-run
+
   cat >/tmp/drapbox-xinitrc <<'EOF'
 xsetroot -solid "#0b0b0b"
 openbox-session &
 exec xterm -fa "Monospace" -fs 12 -e /usr/bin/env bash /tmp/drapbox-run
 EOF
 
-  cp "$SELF" /tmp/drapbox-run
-  chmod +x /tmp/drapbox-run
   exec startx /tmp/drapbox-xinitrc -- :0
 fi
 
@@ -496,6 +556,7 @@ if [[ "$SWAP_G" != "0" ]]; then
   fi
 fi
 
+# Persist installer choices for first boot
 mkdir -p "$MNT/var/lib/drapbox"
 echo "$ATV_VARIANT" > "$MNT/var/lib/drapbox/waydroid_variant"
 echo "$AUTOSWITCH"  > "$MNT/var/lib/drapbox/autoswitch"
@@ -591,6 +652,7 @@ gtk-application-prefer-dark-theme=1
 EOF
 chown "$USERNAME:$USERNAME" "$UHOME/.config/gtk-3.0/settings.ini"
 
+# NOTE: Keep your existing overlay/uxplayd/miracastd/host-actions/firstboot/autologin code here unchanged.
 CHROOT
 
 chmod +x "$MNT/root/drapbox-chroot.sh"
