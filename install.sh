@@ -174,18 +174,36 @@ fix_system_after_overlay() {
   echo "• [ramroot] Fixing system state after overlay…"
 
   mkdir -p /var/lib/pacman /var/cache/pacman/pkg /etc/pacman.d
-  rm -rf /etc/pacman.d/gnupg
-  mkdir -p /etc/pacman.d/gnupg
-  chmod 700 /etc/pacman.d/gnupg
-
   mkdir -p /tmp
   chmod 1777 /tmp
 
+  # DNS minimal si absent
   [[ -e /etc/resolv.conf ]] || echo "nameserver 1.1.1.1" > /etc/resolv.conf
 
-  (systemctl start haveged >/dev/null 2>&1 || true)
-  (systemctl start rngd >/dev/null 2>&1 || true)
+  # ---- GNUPG: DO NOT rm -rf (can be busy on archiso) ----
+  install -d -m 700 /etc/pacman.d/gnupg
 
+  # Force overlay copy-up (make sure it's in upperdir and writable)
+  # Writing a file triggers copy-up even if dir existed in lower.
+  : > /etc/pacman.d/gnupg/.drapbox_copyup 2>/dev/null || true
+  chmod 700 /etc/pacman.d/gnupg || true
+
+  # If gpg is running/locking, try to release (best effort)
+  pkill -x gpg-agent >/dev/null 2>&1 || true
+  pkill -x dirmngr   >/dev/null 2>&1 || true
+
+  # Remove only lock/socket files (safe)
+  rm -f /etc/pacman.d/gnupg/S.gpg-agent* \
+        /etc/pacman.d/gnupg/.#* \
+        /etc/pacman.d/gnupg/*.lock \
+        /etc/pacman.d/gnupg/crls.d/*.lock \
+        >/dev/null 2>&1 || true
+
+  # Ensure entropy helpers (won't fail if absent)
+  systemctl start haveged >/dev/null 2>&1 || true
+  systemctl start rngd    >/dev/null 2>&1 || true
+
+  # Initialize keyring (idempotent-ish, best effort)
   pacman-key --init >/dev/null 2>&1 || true
   pacman-key --populate archlinux >/dev/null 2>&1 || true
 
