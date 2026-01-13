@@ -14,21 +14,22 @@ need(){ command -v "$1" >/dev/null 2>&1 || die "Missing: $1"; }
 need pacman
 need curl
 
+# Force TERM for ncurses tools (whiptail, etc.)
+export TERM="${TERM:-linux}"
+
 # =============================================================================
-# Logging (everything to file + still visible on screen)
+# Logging (everything to file + still on screen)
 # =============================================================================
 LOG_DIR="/run/drapbox"
 mkdir -p "$LOG_DIR"
 LOG_FILE="${LOG_FILE:-$LOG_DIR/install-$(date +%Y%m%d-%H%M%S).log}"
-
-# Mirror stdout+stderr to log
 exec > >(tee -a "$LOG_FILE") 2>&1
 echo "=== DrapBox installer log: $LOG_FILE ==="
 echo "Started: $(date -Is)"
 echo
 
 # =============================================================================
-# Robust launcher + RAM-root overlay (works with bash <(curl ...))
+# Robust launcher (works with bash <(curl ...))
 # =============================================================================
 SCRIPT_URL="${SCRIPT_URL:-https://raw.githubusercontent.com/DrapNard/DrapBox/refs/heads/main/install.sh}"
 SELF="${SELF:-/run/drapbox-installer.sh}"
@@ -42,6 +43,9 @@ _snapshot_self() {
 }
 _snapshot_self
 
+# =============================================================================
+# RAM-root overlay (archiso cow space workaround)
+# =============================================================================
 IN_RAMROOT="${IN_RAMROOT:-0}"
 
 root_free_mb(){ df -Pm / | awk 'NR==2{print $4}'; }
@@ -63,14 +67,17 @@ cleanup_ramroot_state() {
 
 enter_ramroot_overlay() {
   local want_mb="$1"
+
   mark_ramroot_if_detected
   (( IN_RAMROOT == 1 )) && return 0
 
+  # Clean half state
   if [[ -e /run/drapbox-ramroot ]] && ! mountpoint -q /run/drapbox-ramroot/merged 2>/dev/null; then
     cleanup_ramroot_state
   fi
 
   mkdir -p /run/drapbox-ramroot/{lower,merged,tmp}
+
   mountpoint -q /run/drapbox-ramroot/lower || mount --rbind / /run/drapbox-ramroot/lower
   mount --make-rprivate /run/drapbox-ramroot/lower || true
 
@@ -88,19 +95,13 @@ enter_ramroot_overlay() {
   mount --bind /run  /run/drapbox-ramroot/merged/run
   mount --bind /tmp  /run/drapbox-ramroot/merged/tmp
 
-  # Copy stable script + keep log path across chroot
+  # Copy stable runner
   install -m 0755 "$SELF" /run/drapbox-ramroot/merged/tmp/drapbox-run
-  mkdir -p /run/drapbox-ramroot/merged/run/drapbox >/dev/null 2>&1 || true
 
+  # IMPORTANT: no env -i (keep TERM + TTY sanity)
   export IN_RAMROOT=1
-  export LOG_FILE="$LOG_FILE"
-  export LOG_DIR="$LOG_DIR"
-
-  exec chroot /run/drapbox-ramroot/merged /usr/bin/env -i \
-    PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
-    IN_RAMROOT=1 LOG_FILE="$LOG_FILE" LOG_DIR="$LOG_DIR" \
-    SCRIPT_URL="$SCRIPT_URL" SELF="$SELF" \
-    /tmp/drapbox-run
+  export LOG_FILE LOG_DIR SCRIPT_URL SELF TERM
+  exec chroot /run/drapbox-ramroot/merged /tmp/drapbox-run
 }
 
 maybe_use_ramroot() {
@@ -134,6 +135,7 @@ fix_system_after_overlay() {
   chmod 1777 /tmp
   [[ -e /etc/resolv.conf ]] || echo "nameserver 1.1.1.1" > /etc/resolv.conf
 
+  # Don't rm -rf gnupg (can be busy). Ensure writable & kill agents.
   install -d -m 700 /etc/pacman.d/gnupg
   : > /etc/pacman.d/gnupg/.drapbox_copyup 2>/dev/null || true
   chmod 700 /etc/pacman.d/gnupg || true
@@ -146,25 +148,120 @@ fix_system_after_overlay() {
 
   pacman-key --init >/dev/null 2>&1 || true
   pacman-key --populate archlinux >/dev/null 2>&1 || true
+
   echo "• [ramroot] Done."
 }
 
 # =============================================================================
-# CLI UI (whiptail)
+# UI backend: whiptail if OK, else fallback plain tty
 # =============================================================================
-ensure_cli_ui() {
-  if ! command -v whiptail >/dev/null 2>&1; then
-    pacman -Sy --noconfirm --needed libnewt >/dev/null
+TTY_DEV="/dev/tty"
+
+_tty_read() {
+  local prompt="$1" default="${2:-}"
+  local ans=""
+  if [[ -r "$TTY_DEV" && -w "$TTY_DEV" ]]; then
+    printf "%s" "$prompt" >"$TTY_DEV"
+    IFS= read -r ans <"$TTY_DEV" || true
+  else
+    printf "%s" "$prompt"
+    IFS= read -r ans || true
   fi
-  need whiptail
+  [[ -n "$ans" ]] && printf "%s" "$ans" || printf "%s" "$default"
 }
 
-ui_msg(){ whiptail --title "$APP" --msgbox "$1\n\nLog: $LOG_FILE" 14 78; }
-ui_yesno(){ whiptail --title "$APP" --yesno "$1" 12 78; }
-ui_input(){ whiptail --title "$APP" --inputbox "$1" 12 78 "$2" 3>&1 1>&2 2>&3; }
-ui_pass(){ whiptail --title "$APP" --passwordbox "$1" 12 78 3>&1 1>&2 2>&3; }
-ui_menu(){ whiptail --title "$APP" --menu "$1" 18 78 10 "${@:2}" 3>&1 1>&2 2>&3; }
+UI_BACKEND="plain"
 
+ensure_cli_ui() {
+  # try whiptail
+  if command -v whiptail >/dev/null 2>&1; then
+    UI_BACKEND="whiptail"
+    return 0
+  fi
+
+  # install minimal ncurses UI
+  pacman -Sy --noconfirm --needed libnewt >/dev/null 2>&1 || true
+  if command -v whiptail >/dev/null 2>&1; then
+    UI_BACKEND="whiptail"
+  else
+    UI_BACKEND="plain"
+  fi
+}
+
+ui_msg() {
+  local msg="$1"
+  if [[ "$UI_BACKEND" == "whiptail" ]]; then
+    whiptail --title "$APP" --msgbox "$msg\n\nLog: $LOG_FILE" 14 78 || true
+  else
+    echo
+    echo "== $APP =="
+    echo -e "$msg"
+    echo "Log: $LOG_FILE"
+    echo
+    _tty_read "Press Enter to continue..." ""
+    echo
+  fi
+}
+
+ui_yesno() {
+  local msg="$1"
+  if [[ "$UI_BACKEND" == "whiptail" ]]; then
+    whiptail --title "$APP" --yesno "$msg" 12 78
+  else
+    local ans
+    ans="$(_tty_read "$msg [y/N]: " "")"
+    [[ "${ans,,}" == "y" || "${ans,,}" == "yes" ]]
+  fi
+}
+
+ui_input() {
+  local msg="$1" def="${2:-}"
+  if [[ "$UI_BACKEND" == "whiptail" ]]; then
+    whiptail --title "$APP" --inputbox "$msg" 12 78 "$def" 3>&1 1>&2 2>&3
+  else
+    _tty_read "$msg [$def]: " "$def"
+  fi
+}
+
+ui_pass() {
+  local msg="$1"
+  if [[ "$UI_BACKEND" == "whiptail" ]]; then
+    whiptail --title "$APP" --passwordbox "$msg" 12 78 3>&1 1>&2 2>&3
+  else
+    # plain fallback (visible). acceptable for debug environments only.
+    echo "(!) Password will be visible in plain mode."
+    _tty_read "$msg: " ""
+  fi
+}
+
+ui_menu() {
+  local title="$1"; shift
+  if [[ "$UI_BACKEND" == "whiptail" ]]; then
+    whiptail --title "$APP" --menu "$title" 18 78 10 "$@" 3>&1 1>&2 2>&3
+    return $?
+  fi
+
+  # Plain menu: args are pairs (tag desc)
+  echo
+  echo "== $title =="
+  local i=0
+  local tags=()
+  while (( $# )); do
+    local tag="$1"; local desc="$2"; shift 2 || true
+    i=$((i+1))
+    tags+=("$tag")
+    printf " %2d) %-12s %s\n" "$i" "$tag" "$desc"
+  done
+  local choice
+  choice="$(_tty_read "Select [1-$i]: " "")"
+  [[ "$choice" =~ ^[0-9]+$ ]] || return 1
+  (( choice >= 1 && choice <= i )) || return 1
+  echo "${tags[$((choice-1))]}"
+}
+
+# =============================================================================
+# Network
+# =============================================================================
 is_online(){
   ping -c1 -W1 1.1.1.1 >/dev/null 2>&1 && return 0
   ping -c1 -W2 archlinux.org >/dev/null 2>&1
@@ -180,7 +277,6 @@ ensure_network(){
     choice="$(ui_menu "No internet detected. Choose:" \
       "ETH"   "Retry Ethernet/DHCP (re-test)" \
       "WIFI"  "Connect Wi-Fi (iwctl)" \
-      "NMTUI" "Network manager UI (nmtui)" \
       "SHELL" "Open shell (manual)" \
       "ABORT" "Abort install"
     )" || true
@@ -188,9 +284,11 @@ ensure_network(){
     case "${choice:-}" in
       ETH) ;;
       WIFI)
+        need iwctl || die "iwctl not found (should come with iwd)"
         local wlan ssid psk
         wlan="$(ls /sys/class/net 2>/dev/null | grep -E '^(wl|wlan)' | head -n1 || true)"
         [[ -n "$wlan" ]] || { ui_msg "No Wi-Fi interface detected."; continue; }
+
         ssid="$(ui_input "SSID for $wlan:" "")" || true
         [[ -n "${ssid:-}" ]] || continue
         psk="$(ui_pass "Password for '$ssid' (empty if open network):")" || true
@@ -203,10 +301,6 @@ ensure_network(){
         else
           iwctl station "$wlan" connect "$ssid" >/dev/null 2>&1 || ui_msg "Wi-Fi connection failed."
         fi
-        ;;
-      NMTUI)
-        ui_msg "nmtui will open. Exit it to return."
-        nmtui || true
         ;;
       SHELL)
         ui_msg "Shell opened. Type 'exit' to return."
@@ -236,8 +330,14 @@ pick_timezone(){
   [[ ${#tzs[@]} -gt 0 ]] || die "No timezone found"
   local args=()
   for t in "${tzs[@]}"; do args+=("$t" ""); done
-  tz="$(ui_menu "Select timezone:" "${args[@]}")"
+  tz="$(ui_menu "Select timezone:" "${args[@]}")" || die "No timezone"
   echo "$tz"
+}
+
+validate_disk() {
+  local d="$1"
+  [[ "$d" =~ ^/dev/ ]] || die "Invalid disk selection: '$d' (UI failed / TERM/TTY issue). Log: $LOG_FILE"
+  [[ -b "$d" ]] || die "Disk is not a block device: '$d'"
 }
 
 # =============================================================================
@@ -247,11 +347,11 @@ maybe_use_ramroot
 fix_system_after_overlay
 ensure_cli_ui
 
-# Keyring baseline
+# Keyring baseline (idempotent)
 pacman -Sy --noconfirm --needed archlinux-keyring >/dev/null 2>&1 || true
 pacman-key --populate archlinux >/dev/null 2>&1 || true
 
-# Minimal live deps only
+# Minimal live deps (NETWORK = iwd + networkmanager ONLY)
 pacman -Sy --noconfirm --needed \
   iwd networkmanager \
   gptfdisk util-linux dosfstools e2fsprogs btrfs-progs \
@@ -259,17 +359,18 @@ pacman -Sy --noconfirm --needed \
   curl git \
   >/dev/null
 
-ui_msg "Welcome.\n\nThis will install DrapBox (Apple TV × Google TV vibe).\n\nStep 1: Internet check."
+ui_msg "Welcome.\n\nThis will install DrapBox.\n\nStep 1: Internet check."
 ensure_network
 
 DISK="$(pick_disk)" || die "No disk selected"
+validate_disk "$DISK"
 
 HOSTNAME="$(ui_input "Hostname (also AirPlay name):" "drapbox")" || die "No hostname"
 USERNAME="$(ui_input "Admin user (sudo):" "drapnard")" || die "No username"
 USERPASS="$(ui_pass "Password for user '$USERNAME':")" || die "No user password"
 ROOTPASS="$(ui_pass "Password for root:")" || die "No root password"
 
-TZ="$(pick_timezone)" || die "No timezone"
+TZ="$(pick_timezone)"
 LOCALE="$(ui_input "Locale (e.g. en_US.UTF-8, fr_FR.UTF-8):" "en_US.UTF-8")" || die "No locale"
 KEYMAP="$(ui_input "Keymap (e.g. us, fr, de):" "us")" || die "No keymap"
 
@@ -305,9 +406,8 @@ HWACCEL="$(ui_menu "Waydroid video HW decode (VA-API):" \
 AUTOLOGIN="no"
 ui_yesno "Appliance mode: autologin on TTY1 + auto-start Sway?" && AUTOLOGIN="yes" || true
 
-# Auto reboot option
 AUTO_REBOOT="yes"
-ui_yesno "Auto reboot after install?\n\nYes = reboot automatically\nNo = drop to shell with logs path" && AUTO_REBOOT="yes" || AUTO_REBOOT="no"
+ui_yesno "Auto reboot after install?\n\nYes = reboot automatically\nNo = stop with shell + log path" && AUTO_REBOOT="yes" || AUTO_REBOOT="no"
 
 CONFIRM=$(
 cat <<EOF
@@ -377,7 +477,6 @@ fi
 
 # ---- Install system ----
 ui_msg "Installing base system + DrapBox stack (this can take a while)…"
-
 pacstrap -K "$MNT" \
   base linux linux-firmware \
   networkmanager iwd wpa_supplicant \
@@ -529,6 +628,5 @@ if [[ "$AUTO_REBOOT" == "yes" ]]; then
 else
   ui_msg "Install complete ✅\n\nAuto-reboot disabled.\n\nLog: $LOG_FILE\n\nDropping to shell."
   echo "Auto-reboot disabled. Log: $LOG_FILE"
-  echo "You can copy it out (e.g. scp) or inspect here."
   bash
 fi
