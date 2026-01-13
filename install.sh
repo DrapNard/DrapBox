@@ -13,10 +13,9 @@ need(){ command -v "$1" >/dev/null 2>&1 || die "Missing: $1"; }
 
 need pacman
 need curl
+
 # -------------------------------
 # Auto RAM-root overlay (archiso cow space workaround)
-# - If / (airootfs) is too small, create an overlay root whose upper is tmpfs
-# - Then re-exec this script inside that merged root (chroot)
 # -------------------------------
 IN_RAMROOT="${IN_RAMROOT:-0}"
 
@@ -49,9 +48,11 @@ enter_ramroot_overlay() {
   mount --bind /run  /run/drapbox-ramroot/merged/run
   mount --bind /tmp  /run/drapbox-ramroot/merged/tmp
 
-  # DNS inside chroot
-  mkdir -p /run/drapbox-ramroot/merged/etc
-  cp -f /etc/resolv.conf /run/drapbox-ramroot/merged/etc/resolv.conf || true
+  # Ensure pacman keyring dir is writable INSIDE merged root (upperdir)
+  mkdir -p /run/drapbox-ramroot/merged/etc/pacman.d
+  rm -rf /run/drapbox-ramroot/merged/etc/pacman.d/gnupg
+  mkdir -p /run/drapbox-ramroot/merged/etc/pacman.d/gnupg
+  chmod 700 /run/drapbox-ramroot/merged/etc/pacman.d/gnupg
 
   # re-run script inside merged root
   install -m 0755 "$0" /run/drapbox-ramroot/merged/tmp/drapbox-run
@@ -60,11 +61,12 @@ enter_ramroot_overlay() {
   local disp="${DISPLAY:-}"
   local xauth="${XAUTHORITY:-}"
 
-  exec chroot /run/drapbox-ramroot/merged /bin/bash -lc \
+  # IMPORTANT: exec bash directly (avoid "-lc" pitfalls / missing funcs)
+  exec chroot /run/drapbox-ramroot/merged /usr/bin/env bash -c \
     "export IN_RAMROOT=1; \
      [[ -n \"$disp\" ]] && export DISPLAY=\"$disp\"; \
      [[ -n \"$xauth\" ]] && export XAUTHORITY=\"$xauth\"; \
-     /tmp/drapbox-run"
+     exec /usr/bin/env bash /tmp/drapbox-run"
 }
 
 maybe_use_ramroot() {
@@ -74,13 +76,8 @@ maybe_use_ramroot() {
   free_mb="$(root_free_mb)"
   mem_mb="$(ram_total_mb)"
 
-  # If / is tight, archiso overlay will explode during pacman.
   local threshold_mb=350
 
-  # Force strategy (works down to 4GB RAM):
-  # - 4GB RAM  -> ~1024MB overlay
-  # - 6GB RAM  -> ~1536MB overlay
-  # - 8GB+ RAM -> up to 8192MB overlay
   local want_mb
   if   (( mem_mb <= 4096 )); then
     want_mb=1024
@@ -95,67 +92,53 @@ maybe_use_ramroot() {
 
   if (( free_mb < threshold_mb )); then
     echo "⚠ airootfs low (${free_mb}MB free). FORCING RAM-root overlay (${want_mb}MB)."
-    echo "  (Low-RAM mode: may be slower/unstable if you install big live deps.)"
     enter_ramroot_overlay "$want_mb"
   fi
 }
 
 fix_system_after_overlay() {
-  # Only useful inside RAM-root overlay
   [[ "${IN_RAMROOT:-0}" == "1" ]] || return 0
 
   echo "• [ramroot] Fixing system state after overlay…"
 
-  # 1) Ensure pacman dirs exist
+  # pacman dirs
   mkdir -p /var/lib/pacman /var/cache/pacman/pkg /etc/pacman.d
 
-  # 2) Ensure GNUPG dir is writable (overlay can make it weird)
-  #    Recreate it to guarantee it's in the upperdir (writable)
+  # Ensure GNUPG is writable (force into upperdir)
   rm -rf /etc/pacman.d/gnupg
   mkdir -p /etc/pacman.d/gnupg
   chmod 700 /etc/pacman.d/gnupg
 
-  # 3) Make sure /tmp is writable (some archiso setups get funky)
+  # tmp
   mkdir -p /tmp
   chmod 1777 /tmp
 
-  # 4) DNS: don't copy resolv.conf (often same file). Just ensure it exists.
-  if [[ ! -e /etc/resolv.conf ]]; then
-    echo "nameserver 1.1.1.1" > /etc/resolv.conf
-  fi
+  # DNS: don't copy (often same file). Ensure exists.
+  [[ -e /etc/resolv.conf ]] || echo "nameserver 1.1.1.1" > /etc/resolv.conf
 
-  # 5) Initialize & populate pacman keyring (fixes "public keyring not found")
-  #    Do it idempotently: if already exists, keep it.
-  if [[ ! -f /etc/pacman.d/gnupg/pubring.kbx ]]; then
-    echo "• [ramroot] Initializing pacman-key…"
-    # Ensure enough entropy; on archiso it's usually fine, but this avoids stalls
-    (systemctl start haveged >/dev/null 2>&1 || true)
-    (systemctl start rngd >/dev/null 2>&1 || true)
+  # Keyring init (mandatory in overlay cases)
+  (systemctl start haveged >/dev/null 2>&1 || true)
+  (systemctl start rngd >/dev/null 2>&1 || true)
 
-    pacman-key --init || true
-    pacman-key --populate archlinux || true
-  fi
+  pacman-key --init || true
+  pacman-key --populate archlinux || true
 
-  # 6) If keyring package is missing/outdated, reinstall it (best-effort)
-  #    This can fix "required key missing from keyring" after overlay weirdness.
-  if ! pacman -Q archlinux-keyring >/dev/null 2>&1; then
-    echo "• [ramroot] Installing archlinux-keyring…"
-    pacman -Sy --noconfirm --needed archlinux-keyring || true
-    pacman-key --populate archlinux || true
-  fi
-
-  # 7) Sync DB sanity (best-effort)
+  # Refresh keyring package if available
   pacman -Sy --noconfirm --needed archlinux-keyring >/dev/null 2>&1 || true
+  pacman-key --populate archlinux >/dev/null 2>&1 || true
 
   echo "• [ramroot] Done."
 }
 
+# ---- Start network services in live (do it before any UI/network checks) ----
+systemctl start iwd >/dev/null 2>&1 || true
+systemctl start NetworkManager >/dev/null 2>&1 || true
 
 # Call this BEFORE installing live packages
 maybe_use_ramroot
 fix_system_after_overlay
 
-# ---- Live deps: MINIMAL (no big UI stacks in live!) ----
+# ---- Live deps: MINIMAL ----
 pacman -Sy --noconfirm --needed \
   archlinux-keyring \
   zenity \
@@ -177,7 +160,6 @@ if ! command -v matchbox-keyboard >/dev/null 2>&1 && ! command -v onboard >/dev/
   pacman -S --noconfirm --needed florence >/dev/null 2>&1 || true
 fi
 
-
 need zenity
 need startx
 need xterm
@@ -193,10 +175,6 @@ need mkfs.fat
 need pacstrap
 need arch-chroot
 need genfstab
-
-# Start network services in live
-systemctl start iwd >/dev/null 2>&1 || true
-systemctl start NetworkManager >/dev/null 2>&1 || true
 
 # ---- Relaunch inside X11 (Openbox) if not already ----
 if [[ -z "${DISPLAY:-}" ]]; then
@@ -233,7 +211,6 @@ start_osk(){
     zerr "No on-screen keyboard available (matchbox-keyboard/onboard/florence not installed)."
   fi
 }
-
 
 is_online(){
   ping -c1 -W1 1.1.1.1 >/dev/null 2>&1 && return 0
@@ -569,9 +546,6 @@ gtk-icon-theme-name=Adwaita
 gtk-application-prefer-dark-theme=1
 EOF
 chown "$USERNAME:$USERNAME" "$UHOME/.config/gtk-3.0/settings.ini"
-
-# --- (the rest of your runtime scripts/services remain identical to your previous chroot block) ---
-# NOTE: Keep your existing overlay/uxplayd/miracastd/host-actions/firstboot/autologin code here unchanged.
 
 CHROOT
 
