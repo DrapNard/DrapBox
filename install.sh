@@ -19,8 +19,7 @@ need curl
 pacman -Sy --noconfirm --needed \
   sway foot xorg-xwayland \
   zenity \
-  networkmanager iwd iwctl nmtui \
-  wvkbd \
+  networkmanager iwd \
   gptfdisk util-linux dosfstools e2fsprogs btrfs-progs \
   arch-install-scripts \
   gtk3 gtk-layer-shell python-gobject \
