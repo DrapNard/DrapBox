@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-APP="DrapBox Installer v5 (CLI)"
+APP="DrapBox Installer v5 (CLI Live)"
 MNT=/mnt
 
 die(){ echo "✗ $*" >&2; exit 1; }
@@ -14,19 +14,29 @@ need(){ command -v "$1" >/dev/null 2>&1 || die "Missing: $1"; }
 need pacman
 need curl
 
-export TERM="${TERM:-linux}"
-TTY_DEV="${TTY_DEV:-/dev/tty}"
+# =============================================================================
+# Bootstrap: ALWAYS run from a real file under bash
+# Fixes: /dev/fd scripts, function "missing", broken re-exec in ramroot/chroot
+# =============================================================================
+SCRIPT_URL="${SCRIPT_URL:-https://raw.githubusercontent.com/DrapNard/DrapBox/refs/heads/main/install.sh}"
+SELF="${SELF:-/run/drapbox/installer.sh}"
+BOOTSTRAPPED="${BOOTSTRAPPED:-0}"
 
-# =============================================================================
-# args
-# =============================================================================
-AUTO_REBOOT="yes"
-for a in "$@"; do
-  case "$a" in
-    --no-reboot) AUTO_REBOOT="no" ;;
-    *) ;;
-  esac
-done
+if (( BOOTSTRAPPED == 0 )); then
+  mkdir -p /run/drapbox
+  curl -fsSL "$SCRIPT_URL" -o "$SELF"
+  chmod +x "$SELF"
+  exec /usr/bin/env -i \
+    BOOTSTRAPPED=1 \
+    SCRIPT_URL="$SCRIPT_URL" \
+    SELF="$SELF" \
+    LOG_FILE="${LOG_FILE:-}" \
+    TERM="${TERM:-linux}" \
+    PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+    bash "$SELF" "$@"
+fi
+
+export TERM="${TERM:-linux}"
 
 # =============================================================================
 # Logging (everything to file + still on screen)
@@ -35,117 +45,103 @@ LOG_DIR="/run/drapbox"
 mkdir -p "$LOG_DIR"
 LOG_FILE="${LOG_FILE:-$LOG_DIR/install-$(date +%Y%m%d-%H%M%S).log}"
 exec > >(tee -a "$LOG_FILE") 2>&1
-echo "=== $APP log: $LOG_FILE ==="
+echo "=== DrapBox installer log: $LOG_FILE ==="
 echo "Started: $(date -Is)"
 echo
 
 # =============================================================================
-# Robust launcher (works with bash <(curl ...))
+# TTY helpers (reliable input/output even if stdin is weird)
 # =============================================================================
-SCRIPT_URL="${SCRIPT_URL:-https://raw.githubusercontent.com/DrapNard/DrapBox/refs/heads/main/install.sh}"
-SELF="${SELF:-/run/drapbox-installer.sh}"
-
-_snapshot_self() {
-  mkdir -p "$(dirname "$SELF")"
-  [[ -s "$SELF" ]] && return 0
-
-  # try capture current script (works if not process substitution)
-  if [[ -r "${0:-}" ]] && [[ "${0:-}" != "/dev/fd/"* ]]; then
-    cat "$0" > "$SELF" 2>/dev/null || true
-  fi
-
-  # fallback: download
-  [[ -s "$SELF" ]] || curl -fsSL "$SCRIPT_URL" -o "$SELF"
-  chmod +x "$SELF"
-}
-_snapshot_self
-
-# =============================================================================
-# CLI UI helpers (NO ncurses)
-# =============================================================================
-_tty_ok(){ [[ -r "$TTY_DEV" && -w "$TTY_DEV" ]]; }
-
-_tty_print(){
-  if _tty hookup; then :; fi
-}
-
-_tty_echo(){
-  if _tty_ok; then echo -e "$*" >"$TTY_DEV"; else echo -e "$*"; fi
-}
-
+TTY_DEV="/dev/tty"
+_tty_echo(){ printf "%b\n" "$*" >"$TTY_DEV"; }
 _tty_readline(){
-  local prompt="$1" default="${2:-}" ans=""
-  if _tty_ok; then
-    printf "%s" "$prompt" >"$TTY_DEV"
-    IFS= read -r ans <"$TTY_DEV" || true
-  else
-    printf "%s" "$prompt"
-    IFS= read -r ans || true
+  local prompt="$1" def="${2:-}" ans=""
+  printf "%b" "$prompt" >"$TTY_DEV"
+  IFS= read -r ans <"$TTY_DEV" || true
+  [[ -n "$ans" ]] && printf "%s" "$ans" || printf "%s" "$def"
+}
+
+# =============================================================================
+# UI backend: whiptail if available, else plain TTY
+# =============================================================================
+UI_BACKEND="plain"
+
+ensure_cli_ui() {
+  if command -v whiptail >/dev/null 2>&1; then
+    UI_BACKEND="whiptail"
+    return 0
   fi
-  [[ -n "$ans" ]] && printf "%s" "$ans" || printf "%s" "$default"
+  # minimal ncurses UI (whiptail comes from libnewt typically)
+  pacman -Sy --noconfirm --needed libnewt >/dev/null 2>&1 || true
+  command -v whiptail >/dev/null 2>&1 && UI_BACKEND="whiptail" || UI_BACKEND="plain"
 }
 
-ui_msg(){
-  _tty_echo ""
-  _tty_echo "== $APP =="
-  _tty_echo "$1"
-  _tty_echo ""
-  _tty_echo "Log: $LOG_FILE"
-  _tty_echo ""
-  _tty_readline "Press Enter to continue..." "" >/dev/null || true
+ui_msg() {
+  local msg="$1"
+  if [[ "$UI_BACKEND" == "whiptail" ]]; then
+    whiptail --title "$APP" --msgbox "$msg\n\nLog: $LOG_FILE" 14 78 || true
+  else
+    _tty_echo ""
+    _tty_echo "== $APP =="
+    _tty_echo "$msg"
+    _tty_echo "Log: $LOG_FILE"
+    _tty_readline "Press Enter to continue..." "" >/dev/null
+    _tty_echo ""
+  fi
 }
 
-ui_yesno(){
-  local msg="$1" ans=""
-  ans="$(_tty_readline "$msg [y/N]: " "")"
-  [[ "${ans,,}" == "y" || "${ans,,}" == "yes" ]]
+ui_yesno() {
+  local msg="$1"
+  if [[ "$UI_BACKEND" == "whiptail" ]]; then
+    whiptail --title "$APP" --yesno "$msg" 12 78
+  else
+    local ans
+    ans="$(_tty_readline "$msg [y/N]: " "")"
+    [[ "${ans,,}" == "y" || "${ans,,}" == "yes" ]]
+  fi
 }
 
-ui_input(){
+ui_input() {
   local msg="$1" def="${2:-}"
-  _tty_readline "$msg${def:+ [$def]}: " "$def"
-}
-
-ui_pass(){
-  local msg="$1" pass=""
-  if _tty_ok; then
-    printf "%s" "$msg: " >"$TTY_DEV"
-    stty -echo <"$TTY_DEV" || true
-    IFS= read -r pass <"$TTY_DEV" || true
-    stty echo <"$TTY_DEV" || true
-    printf "\n" >"$TTY_DEV"
+  if [[ "$UI_BACKEND" == "whiptail" ]]; then
+    whiptail --title "$APP" --inputbox "$msg" 12 78 "$def" 3>&1 1>&2 2>&3
   else
-    # worst-case fallback
-    pass="$(_tty_readline "$msg (visible): " "")"
+    _tty_readline "$msg [$def]: " "$def"
   fi
-  printf "%s" "$pass"
 }
 
-ui_menu(){
+ui_pass() {
+  local msg="$1"
+  if [[ "$UI_BACKEND" == "whiptail" ]]; then
+    whiptail --title "$APP" --passwordbox "$msg" 12 78 3>&1 1>&2 2>&3
+  else
+    _tty_echo "(!) Password will be visible in plain mode."
+    _tty_readline "$msg: " ""
+  fi
+}
+
+ui_menu() {
   local title="$1"; shift
-  # args are pairs: tag desc
+  if [[ "$UI_BACKEND" == "whiptail" ]]; then
+    whiptail --title "$APP" --menu "$title" 18 78 10 "$@" 3>&1 1>&2 2>&3
+    return $?
+  fi
+
   _tty_echo ""
   _tty_echo "== $title =="
   local i=0
   local tags=()
   while (( $# )); do
-    local tag="$1" desc="$2"; shift 2 || true
+    local tag="$1"; local desc="$2"; shift 2 || true
     i=$((i+1))
     tags+=("$tag")
-    _tty_echo " $i) $tag  - $desc"
+    printf " %2d) %-12s %s\n" "$i" "$tag" "$desc" >"$TTY_DEV"
   done
-  _tty_echo ""
   local choice
   choice="$(_tty_readline "Select [1-$i]: " "")"
   [[ "$choice" =~ ^[0-9]+$ ]] || return 1
   (( choice >= 1 && choice <= i )) || return 1
-  printf "%s" "${tags[$((choice-1))]}"
-}
-
-validate_disk(){
-  local d="$1"
-  [[ "$d" =~ ^/dev/ ]] || die "Invalid disk selection: '$d'"
-  [[ -b "$d" ]] || die "Disk is not a block device: '$d'"
+  echo "${tags[$((choice-1))]}"
 }
 
 # =============================================================================
@@ -156,32 +152,28 @@ IN_RAMROOT="${IN_RAMROOT:-0}"
 root_free_mb(){ df -Pm / | awk 'NR==2{print $4}'; }
 ram_total_mb(){ awk '/MemTotal/ {printf "%.0f\n", $2/1024}' /proc/meminfo; }
 
-is_drapbox_ramroot_active(){
+is_drapbox_ramroot_active() {
   [[ "${IN_RAMROOT:-0}" == "1" ]] && return 0
   local fst; fst="$(findmnt -n -o FSTYPE / 2>/dev/null || true)"
   [[ "$fst" == "overlay" ]] && grep -q "/run/drapbox-ramroot" /proc/mounts 2>/dev/null
 }
 
-mark_ramroot_if_detected(){
-  if is_drapbox_ramroot_active; then
-    export IN_RAMROOT=1
-  fi
-}
+mark_ramroot_if_detected(){ is_drapbox_ramroot_active && export IN_RAMROOT=1 || true; }
 
-cleanup_ramroot_state(){
+cleanup_ramroot_state() {
   umount -R /run/drapbox-ramroot/merged >/dev/null 2>&1 || true
   umount -R /run/drapbox-ramroot/lower  >/dev/null 2>&1 || true
   umount -R /run/drapbox-ramroot/tmp    >/dev/null 2>&1 || true
   rm -rf /run/drapbox-ramroot >/dev/null 2>&1 || true
 }
 
-enter_ramroot_overlay(){
+enter_ramroot_overlay() {
   local want_mb="$1"
 
   mark_ramroot_if_detected
-  (( IN_RAMROOT == 1 )) && { echo "• ramroot already active, skipping."; return 0; }
+  (( IN_RAMROOT == 1 )) && return 0
 
-  # clean half-state
+  # clean half-state from previous crash
   if [[ -e /run/drapbox-ramroot ]] && ! mountpoint -q /run/drapbox-ramroot/merged 2>/dev/null; then
     cleanup_ramroot_state
   fi
@@ -198,7 +190,6 @@ enter_ramroot_overlay(){
     -o "lowerdir=/run/drapbox-ramroot/lower,upperdir=/run/drapbox-ramroot/tmp/upper,workdir=/run/drapbox-ramroot/tmp/work" \
     /run/drapbox-ramroot/merged
 
-  # bind essentials
   for d in proc sys dev run tmp; do mkdir -p "/run/drapbox-ramroot/merged/$d"; done
   mount --bind /proc /run/drapbox-ramroot/merged/proc
   mount --bind /sys  /run/drapbox-ramroot/merged/sys
@@ -206,25 +197,24 @@ enter_ramroot_overlay(){
   mount --bind /run  /run/drapbox-ramroot/merged/run
   mount --bind /tmp  /run/drapbox-ramroot/merged/tmp
 
-  # copy runner
+  # copy stable runner
   install -m 0755 "$SELF" /run/drapbox-ramroot/merged/tmp/drapbox-run
 
   export IN_RAMROOT=1
-  export LOG_FILE LOG_DIR SCRIPT_URL SELF TERM TTY_DEV AUTO_REBOOT
-  exec chroot /run/drapbox-ramroot/merged /tmp/drapbox-run "$@"
+  export LOG_FILE LOG_DIR SCRIPT_URL SELF TERM BOOTSTRAPPED PATH
+
+  exec chroot /run/drapbox-ramroot/merged /usr/bin/env bash /tmp/drapbox-run
 }
 
-maybe_use_ramroot(){
+maybe_use_ramroot() {
   mark_ramroot_if_detected
   (( IN_RAMROOT == 1 )) && return 0
   mountpoint -q /run/drapbox-ramroot/merged 2>/dev/null && { export IN_RAMROOT=1; return 0; }
 
   local free_mb mem_mb threshold_mb want_mb
-  free_mb="$(root_free_mb)"
-  mem_mb="$(ram_total_mb)"
+  free_mb="$(root_free_mb)"; mem_mb="$(ram_total_mb)"
   threshold_mb=350
 
-  # Force down to 4GB
   if   (( mem_mb <= 4096 )); then want_mb=1024
   elif (( mem_mb <= 6144 )); then want_mb=1536
   elif (( mem_mb <= 8192 )); then want_mb=2048
@@ -239,7 +229,7 @@ maybe_use_ramroot(){
   fi
 }
 
-fix_system_after_overlay(){
+fix_system_after_overlay() {
   [[ "${IN_RAMROOT:-0}" == "1" ]] || return 0
   echo "• [ramroot] Fixing system state after overlay…"
 
@@ -247,6 +237,7 @@ fix_system_after_overlay(){
   chmod 1777 /tmp
   [[ -e /etc/resolv.conf ]] || echo "nameserver 1.1.1.1" > /etc/resolv.conf
 
+  # pacman keyring: avoid rm -rf (busy). ensure writable & copy-up.
   install -d -m 700 /etc/pacman.d/gnupg
   : > /etc/pacman.d/gnupg/.drapbox_copyup 2>/dev/null || true
   chmod 700 /etc/pacman.d/gnupg || true
@@ -294,14 +285,13 @@ ensure_network(){
         wlan="$(ls /sys/class/net 2>/dev/null | grep -E '^(wl|wlan)' | head -n1 || true)"
         [[ -n "$wlan" ]] || { ui_msg "No Wi-Fi interface detected."; continue; }
 
-        ssid="$(ui_input "SSID for $wlan" "")" || true
+        ssid="$(ui_input "SSID for $wlan:" "")" || true
         [[ -n "${ssid:-}" ]] || continue
-        psk="$(ui_pass "Password for '$ssid' (empty if open network)")" || true
+        psk="$(ui_pass "Password for '$ssid' (empty if open network):")" || true
 
         iwctl device "$wlan" set-property Powered on >/dev/null 2>&1 || true
         iwctl station "$wlan" scan >/dev/null 2>&1 || true
         sleep 1
-
         if [[ -n "${psk:-}" ]]; then
           iwctl --passphrase "$psk" station "$wlan" connect "$ssid" >/dev/null 2>&1 || ui_msg "Wi-Fi connection failed."
         else
@@ -310,43 +300,89 @@ ensure_network(){
         ;;
       SHELL)
         ui_msg "Shell opened. Type 'exit' to return."
-        bash </dev/tty >/dev/tty 2>/dev/tty || true
+        bash || true
         ;;
       ABORT|*) die "Aborted" ;;
     esac
   done
 }
 
-pick_disk(){
-  mapfile -t lines < <(lsblk -dnpo NAME,SIZE,MODEL,TYPE | awk '$4=="disk"{print $1 "|" $2 " " $3}')
-  [[ ${#lines[@]} -gt 0 ]] || die "No disks found"
-  local args=()
-  for l in "${lines[@]}"; do args+=("${l%%|*}" "${l#*|}"); done
+# =============================================================================
+# Disk picker (robust, always shows disks, never returns empty)
+# =============================================================================
+is_live_disk() {
+  local boot_src pk
+  boot_src="$(findmnt -n -o SOURCE /run/archiso/bootmnt 2>/dev/null || true)"
+  [[ -n "$boot_src" ]] || return 1
+  pk="$(lsblk -no PKNAME "$boot_src" 2>/dev/null || true)"
+  if [[ -n "$pk" ]]; then
+    [[ "/dev/$pk" == "$1" ]]
+  else
+    [[ "$boot_src" == "$1" ]]
+  fi
+}
 
-  # build menu pairs
-  local menu=()
-  for ((i=0;i<${#args[@]};i+=2)); do
-    menu+=("${args[i]}" "${args[i+1]}")
+pick_disk() {
+  while true; do
+    _tty_echo ""
+    _tty_echo "=== Disks detected (target will be WIPED) ==="
+    _tty_echo "NAME        SIZE   MODEL"
+    _tty_echo "-------------------------------------------"
+
+    mapfile -t disks < <(lsblk -dn -o NAME,SIZE,MODEL,TYPE | awk '$4=="disk"{printf "/dev/%s\t%s\t%s\n",$1,$2,$3}')
+    ((${#disks[@]})) || die "No disks found."
+
+    local i=0
+    local paths=()
+    for line in "${disks[@]}"; do
+      i=$((i+1))
+      local dev size model
+      dev="$(awk '{print $1}' <<<"$line")"
+      size="$(awk '{print $2}' <<<"$line")"
+      model="$(cut -f3- <<<"$line" | sed 's/[[:space:]]\+/ /g')"
+      paths+=("$dev")
+      printf "%2d) %-10s %-6s %s\n" "$i" "$dev" "$size" "$model" >"$TTY_DEV"
+    done
+
+    _tty_echo ""
+    local choice
+    choice="$(_tty_readline "Select disk number [1-$i] (or 'r' to refresh): " "")"
+
+    [[ -z "$choice" ]] && continue
+    if [[ "${choice,,}" == "r" ]]; then
+      continue
+    fi
+    [[ "$choice" =~ ^[0-9]+$ ]] || continue
+    (( choice >= 1 && choice <= i )) || continue
+
+    local d="${paths[$((choice-1))]}"
+    [[ -b "$d" ]] || { _tty_echo "Not a block device: $d"; continue; }
+
+    if is_live_disk "$d"; then
+      _tty_echo ""
+      _tty_echo "⚠ WARNING: $d looks like the LIVE media (archiso bootmnt)."
+      ui_yesno "Are you REALLY sure you want to wipe $d ?" || continue
+    else
+      ui_yesno "Confirm wipe target: $d ?" || continue
+    fi
+
+    echo "$d"
+    return 0
   done
-
-  ui_menu "Select target disk (WILL BE WIPED):" "${menu[@]}"
 }
 
 pick_timezone(){
-  local filt tz
-  filt="$(ui_input "Timezone search (Paris/New_York/Tokyo). Empty=list first 200" "")" || true
-  local tzs=()
+  local filt
+  filt="$(ui_input "Timezone search (Paris/New_York/Tokyo). Empty=list first 200:" "")" || true
   if [[ -n "${filt:-}" ]]; then
     mapfile -t tzs < <(timedatectl list-timezones | grep -i "$filt" | head -n 200)
   else
     mapfile -t tzs < <(timedatectl list-timezones | head -n 200)
   fi
-  [[ ${#tzs[@]} -gt 0 ]] || die "No timezone found"
-
-  local menu=()
-  for t in "${tzs[@]}"; do menu+=("$t" ""); done
-  tz="$(ui_menu "Select timezone:" "${menu[@]}")" || die "No timezone"
-  echo "$tz"
+  ((${#tzs[@]})) || die "No timezone found"
+  local args=()
+  for t in "${tzs[@]}"; do args+=("$t" ""); done
+  ui_menu "Select timezone:" "${args[@]}"
 }
 
 # =============================================================================
@@ -354,8 +390,9 @@ pick_timezone(){
 # =============================================================================
 maybe_use_ramroot
 fix_system_after_overlay
+ensure_cli_ui
 
-# Keyring baseline
+# Keyring baseline (idempotent)
 pacman -Sy --noconfirm --needed archlinux-keyring >/dev/null 2>&1 || true
 pacman-key --populate archlinux >/dev/null 2>&1 || true
 
@@ -371,16 +408,23 @@ ui_msg "Welcome.\n\nThis will install DrapBox.\n\nStep 1: Internet check."
 ensure_network
 
 DISK="$(pick_disk)" || die "No disk selected"
-validate_disk "$DISK"
+[[ -n "$DISK" ]] || die "Disk selection returned empty. Log: $LOG_FILE"
+[[ -b "$DISK" ]] || die "Selected disk is not a block device: '$DISK'"
 
-HOSTNAME="$(ui_input "Hostname (also AirPlay name)" "drapbox")" || die "No hostname"
-USERNAME="$(ui_input "Admin user (sudo)" "drapnard")" || die "No username"
-USERPASS="$(ui_pass "Password for user '$USERNAME'")" || die "No user password"
-ROOTPASS="$(ui_pass "Password for root")" || die "No root password"
+# Show selected disk details (explicit)
+_tty_echo ""
+_tty_echo "Selected disk: $DISK"
+lsblk -o NAME,SIZE,TYPE,MOUNTPOINT "$DISK" || true
+_tty_echo ""
 
-TZ="$(pick_timezone)"
-LOCALE="$(ui_input "Locale (e.g. en_US.UTF-8, fr_FR.UTF-8)" "en_US.UTF-8")" || die "No locale"
-KEYMAP="$(ui_input "Keymap (e.g. us, fr, de)" "us")" || die "No keymap"
+HOSTNAME="$(ui_input "Hostname (also AirPlay name):" "drapbox")" || die "No hostname"
+USERNAME="$(ui_input "Admin user (sudo):" "drapnard")" || die "No username"
+USERPASS="$(ui_pass "Password for user '$USERNAME':")" || die "No user password"
+ROOTPASS="$(ui_pass "Password for root:")" || die "No root password"
+
+TZ="$(pick_timezone)" || die "No timezone"
+LOCALE="$(ui_input "Locale (e.g. en_US.UTF-8, fr_FR.UTF-8):" "en_US.UTF-8")" || die "No locale"
+KEYMAP="$(ui_input "Keymap (e.g. us, fr, de):" "us")" || die "No keymap"
 
 FS="$(ui_menu "Root filesystem:" \
   "ext4"  "Simple and robust" \
@@ -414,9 +458,11 @@ HWACCEL="$(ui_menu "Waydroid video HW decode (VA-API):" \
 AUTOLOGIN="no"
 ui_yesno "Appliance mode: autologin on TTY1 + auto-start Sway?" && AUTOLOGIN="yes" || true
 
-ui_yesno "Auto reboot after install?" && AUTO_REBOOT="yes" || AUTO_REBOOT="no"
+AUTO_REBOOT="yes"
+ui_yesno "Auto reboot after install?\n\nYes = reboot automatically\nNo = stop with shell + log path" && AUTO_REBOOT="yes" || AUTO_REBOOT="no"
 
-ui_yesno "$(cat <<EOF
+CONFIRM=$(
+cat <<EOF
 SUMMARY (THIS WILL WIPE THE DISK)
 
 Disk: $DISK
@@ -436,10 +482,13 @@ Log file: $LOG_FILE
 
 Proceed?
 EOF
-)" || die "Aborted"
+)
+
+ui_yesno "$CONFIRM" || die "Aborted"
 
 # ---- Partition / format ----
 ui_msg "Partitioning + formatting…"
+
 umount -R "$MNT" >/dev/null 2>&1 || true
 swapoff -a >/dev/null 2>&1 || true
 
@@ -480,7 +529,8 @@ if [[ "$FS" == "btrfs" ]]; then
 fi
 
 # ---- Install system ----
-ui_msg "Installing base system + DrapBox stack… (can take a while)"
+ui_msg "Installing base system + DrapBox stack (this can take a while)…"
+
 pacstrap -K "$MNT" \
   base linux linux-firmware \
   networkmanager iwd wpa_supplicant \
@@ -631,5 +681,6 @@ if [[ "$AUTO_REBOOT" == "yes" ]]; then
   reboot
 else
   ui_msg "Install complete ✅\n\nAuto-reboot disabled.\n\nLog: $LOG_FILE\n\nDropping to shell."
-  bash </dev/tty >/dev/tty 2>/dev/tty
+  _tty_echo "Auto-reboot disabled. Log: $LOG_FILE"
+  bash
 fi
