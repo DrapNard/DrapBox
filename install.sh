@@ -14,39 +14,19 @@ need(){ command -v "$1" >/dev/null 2>&1 || die "Missing: $1"; }
 need pacman
 need curl
 
-# Force TERM for ncurses tools
+# Force TERM for ncurses tools (whiptail, etc.)
 export TERM="${TERM:-linux}"
 
 # =============================================================================
-# Logging (tee) + keep real TTY for UI
+# Logging (everything to file + still on screen)
 # =============================================================================
 LOG_DIR="/run/drapbox"
 mkdir -p "$LOG_DIR"
 LOG_FILE="${LOG_FILE:-$LOG_DIR/install-$(date +%Y%m%d-%H%M%S).log}"
-
-TTY_DEV="${TTY_DEV:-/dev/tty}"
-
 exec > >(tee -a "$LOG_FILE") 2>&1
-
 echo "=== DrapBox installer log: $LOG_FILE ==="
 echo "Started: $(date -Is)"
-echo "TERM=$TERM"
 echo
-
-on_error() {
-  local ec=$?
-  echo
-  echo "✗ Installer crashed (exit=$ec)."
-  echo "Log: $LOG_FILE"
-  echo
-  # Drop to shell for debug if possible
-  if [[ -r "$TTY_DEV" && -w "$TTY_DEV" ]]; then
-    echo "Dropping to shell for debug. Type 'exit' to quit." >"$TTY_DEV"
-    bash </dev/tty >/dev/tty 2>/dev/tty || true
-  fi
-  exit $ec
-}
-trap on_error ERR
 
 # =============================================================================
 # Robust launcher (works with bash <(curl ...))
@@ -97,7 +77,6 @@ enter_ramroot_overlay() {
   fi
 
   mkdir -p /run/drapbox-ramroot/{lower,merged,tmp}
-
   mountpoint -q /run/drapbox-ramroot/lower || mount --rbind / /run/drapbox-ramroot/lower
   mount --make-rprivate /run/drapbox-ramroot/lower || true
 
@@ -118,9 +97,8 @@ enter_ramroot_overlay() {
   # Copy stable runner
   install -m 0755 "$SELF" /run/drapbox-ramroot/merged/tmp/drapbox-run
 
-  # Keep env (no env -i) + keep UI TTY
   export IN_RAMROOT=1
-  export LOG_FILE LOG_DIR SCRIPT_URL SELF TERM TTY_DEV
+  export LOG_FILE LOG_DIR SCRIPT_URL SELF TERM
   exec chroot /run/drapbox-ramroot/merged /tmp/drapbox-run
 }
 
@@ -172,25 +150,10 @@ fix_system_after_overlay() {
 }
 
 # =============================================================================
-# UI backend: TTY-safe whiptail or plain
+# UI backend: whiptail forced to /dev/tty (works with tee logging)
 # =============================================================================
+TTY_DEV="${TTY_DEV:-/dev/tty}"
 UI_BACKEND="plain"
-
-ensure_cli_ui() {
-  if command -v whiptail >/dev/null 2>&1 && [[ -r "$TTY_DEV" && -w "$TTY_DEV" ]]; then
-    UI_BACKEND="whiptail"
-    return 0
-  fi
-
-  # Install minimal ncurses UI (best effort)
-  pacman -Sy --noconfirm --needed libnewt >/dev/null 2>&1 || true
-
-  if command -v whiptail >/dev/null 2>&1 && [[ -r "$TTY_DEV" && -w "$TTY_DEV" ]]; then
-    UI_BACKEND="whiptail"
-  else
-    UI_BACKEND="plain"
-  fi
-}
 
 _tty_read() {
   local prompt="$1" default="${2:-}"
@@ -205,6 +168,17 @@ _tty_read() {
   [[ -n "$ans" ]] && printf "%s" "$ans" || printf "%s" "$default"
 }
 
+_wp_ok() {
+  command -v whiptail >/dev/null 2>&1 && [[ -r "$TTY_DEV" && -w "$TTY_DEV" ]]
+}
+
+ensure_cli_ui() {
+  if _wp_ok; then UI_BACKEND="whiptail"; return 0; fi
+  pacman -Sy --noconfirm --needed libnewt >/dev/null 2>&1 || true
+  if _wp_ok; then UI_BACKEND="whiptail"; else UI_BACKEND="plain"; fi
+}
+
+# whiptail wrappers: always talk to /dev/tty, return value via stdout when needed
 ui_msg() {
   local msg="$1"
   if [[ "$UI_BACKEND" == "whiptail" ]]; then
@@ -212,9 +186,10 @@ ui_msg() {
       </dev/tty >/dev/tty 2>/dev/tty || true
   else
     echo
-    echo "== $APP ==" >"$TTY_DEV" 2>/dev/null || true
-    echo -e "$msg" >"$TTY_DEV" 2>/dev/null || echo -e "$msg"
-    echo "Log: $LOG_FILE" >"$TTY_DEV" 2>/dev/null || true
+    echo "== $APP =="
+    echo -e "$msg"
+    echo "Log: $LOG_FILE"
+    echo
     _tty_read "Press Enter to continue..." ""
     echo
   fi
@@ -248,7 +223,7 @@ ui_pass() {
     whiptail --title "$APP" --passwordbox "$msg" 12 78 --output-fd 1 \
       </dev/tty 2>/dev/tty
   else
-    echo "(!) Password will be visible in plain mode." >"$TTY_DEV" 2>/dev/null || true
+    echo "(!) Password will be visible in plain mode."
     _tty_read "$msg: " ""
   fi
 }
@@ -261,16 +236,14 @@ ui_menu() {
     return $?
   fi
 
-  echo >"$TTY_DEV" 2>/dev/null || true
-  echo "== $title ==" >"$TTY_DEV" 2>/dev/null || echo "== $title =="
-  local i=0
-  local tags=()
+  echo
+  echo "== $title =="
+  local i=0 tags=()
   while (( $# )); do
-    local tag="$1"; local desc="$2"; shift 2 || true
+    local tag="$1" desc="$2"; shift 2 || true
     i=$((i+1))
     tags+=("$tag")
-    printf " %2d) %-12s %s\n" "$i" "$tag" "$desc" >"$TTY_DEV" 2>/dev/null || \
-      printf " %2d) %-12s %s\n" "$i" "$tag" "$desc"
+    printf " %2d) %-12s %s\n" "$i" "$tag" "$desc"
   done
   local choice
   choice="$(_tty_read "Select [1-$i]: " "")"
@@ -356,7 +329,7 @@ pick_timezone(){
 
 validate_disk() {
   local d="$1"
-  [[ "$d" =~ ^/dev/ ]] || die "Invalid disk selection: '$d' (UI failed). Log: $LOG_FILE"
+  [[ "$d" =~ ^/dev/ ]] || die "Invalid disk selection: '$d' (UI failed / TERM/TTY issue). Log: $LOG_FILE"
   [[ -b "$d" ]] || die "Disk is not a block device: '$d'"
 }
 
@@ -367,7 +340,7 @@ maybe_use_ramroot
 fix_system_after_overlay
 ensure_cli_ui
 
-# Keyring baseline
+# Keyring baseline (idempotent)
 pacman -Sy --noconfirm --needed archlinux-keyring >/dev/null 2>&1 || true
 pacman-key --populate archlinux >/dev/null 2>&1 || true
 
