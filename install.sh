@@ -626,6 +626,13 @@ EOF
   chown "$USERNAME:$USERNAME" "$UHOME/.config/sway/config"
 fi
 
+# --- IMPORTANT: ensure pacman/libalpm matches paru-bin ---
+pacman -Sy --noconfirm archlinux-keyring
+pacman -Syu --noconfirm
+# ensure pacman present (brings libalpm)
+pacman -S --noconfirm pacman
+
+
 # =============================================================================
 # AUR via paru-bin (install non-debug package explicitly)
 # =============================================================================
