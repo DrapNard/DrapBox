@@ -18,6 +18,12 @@ need awk
 need sed
 need mount
 need umount
+need sgdisk
+need mkfs.fat
+need mkfs.ext4
+need genfstab
+need arch-chroot
+need pacstrap
 
 export TERM="${TERM:-linux}"
 TTY_DEV="/dev/tty"
@@ -164,18 +170,15 @@ ui_msg(){
   _tty_echo "Log: $LOG_FILE"
   _tty_readline "Press Enter to continue..." "" >/dev/null
 }
-
 ui_yesno(){
   local ans
   ans="$(_tty_readline "$1 [y/N]: " "")"
   [[ "${ans,,}" == "y" || "${ans,,}" == "yes" ]]
 }
-
 ui_input(){
   local msg="$1" def="${2:-}"
   _tty_readline "$msg [$def]: " "$def"
 }
-
 ui_pass(){
   local msg="$1"
   _tty_echo "(!) Password input is visible in pure CLI mode."
@@ -183,15 +186,13 @@ ui_pass(){
 }
 
 # =============================================================================
-# Disk picker (robust) + auto-unmount + wipe safety
+# Disk picker
 # =============================================================================
 _unmount_disk_everything(){
   local disk="$1"
-  # unmount any mounted partitions belonging to disk
   local parts
   mapfile -t parts < <(lsblk -lnpo NAME "$disk" 2>/dev/null | tail -n +2 || true)
   for p in "${parts[@]}"; do
-    # unmount by mountpoint if exists
     local mps
     mapfile -t mps < <(lsblk -lnpo MOUNTPOINT "$p" 2>/dev/null | awk 'NF{print}')
     for mp in "${mps[@]}"; do
@@ -261,7 +262,6 @@ is_online(){
   ping -c1 -W1 1.1.1.1 >/dev/null 2>&1 && return 0
   ping -c1 -W2 archlinux.org >/dev/null 2>&1
 }
-
 ensure_network(){
   timedatectl set-ntp true >/dev/null 2>&1 || true
   systemctl start iwd >/dev/null 2>&1 || true
@@ -342,13 +342,6 @@ FS="$(ui_input "Root FS (ext4/btrfs):" "ext4")"
 SWAP_G="$(ui_input "Swapfile size GiB (0=none):" "0")"
 [[ "$SWAP_G" =~ ^[0-9]+$ ]] || die "Invalid swap size: $SWAP_G"
 
-ATV_VARIANT="$(ui_input "Waydroid variant (GAPPS/VANILLA):" "GAPPS")"
-AUTOSWITCH="$(ui_input "Auto-switch (ON/OFF):" "ON")"
-HWACCEL="$(ui_input "HW decode (ON/OFF):" "ON")"
-
-AUTOLOGIN="no"
-ui_yesno "Appliance mode: autologin on TTY1 + auto-start Sway?" && AUTOLOGIN="yes" || true
-
 AUTO_REBOOT="yes"
 ui_yesno "Auto reboot after install?" && AUTO_REBOOT="yes" || AUTO_REBOOT="no"
 
@@ -362,10 +355,6 @@ _tty_echo " Locale:    $LOCALE"
 _tty_echo " Keymap:    $KEYMAP"
 _tty_echo " Hostname:  $HOSTNAME"
 _tty_echo " User:      $USERNAME"
-_tty_echo " Waydroid:  $ATV_VARIANT"
-_tty_echo " Autosw:    $AUTOSWITCH"
-_tty_echo " HW decode: $HWACCEL"
-_tty_echo " Autologin: $AUTOLOGIN"
 _tty_echo " Log:       $LOG_FILE"
 _tty_echo ""
 ui_yesno "Proceed?" || die "Aborted"
@@ -375,10 +364,8 @@ ui_msg "Partitioning + formatting…"
 
 umount -R "$MNT" >/dev/null 2>&1 || true
 swapoff -a >/dev/null 2>&1 || true
-
 _unmount_disk_everything "$DISK"
 
-# Some archiso auto-mounts /dev/sdX1; kill it
 wipefs -af "$DISK" >/dev/null 2>&1 || true
 
 sgdisk --zap-all "$DISK"
@@ -396,7 +383,6 @@ if [[ "$DISK" =~ nvme|mmcblk ]]; then
   ROOT_PART="${DISK}p2"
 fi
 
-# unmount partitions if still mounted
 umount -R "$EFI_PART" >/dev/null 2>&1 || true
 umount -R "$ROOT_PART" >/dev/null 2>&1 || true
 
@@ -421,24 +407,18 @@ if [[ "$FS" == "btrfs" ]]; then
   mount "$EFI_PART" "$MNT/boot"
 fi
 
-# =============================================================================
-# Pacstrap: repo base only + base-devel (AUR build in chroot)
-# =============================================================================
+# ---- Pacstrap base ----
 ui_msg "Installing base system (repo packages)…"
 
 BASE_PKGS=(
   base linux linux-firmware
-  networkmanager iwd wpa_supplicant
   sudo git curl jq
-  sway foot wl-clipboard wlr-randr xorg-xwayland
-  pipewire wireplumber pipewire-audio
-  xdg-desktop-portal xdg-desktop-portal-wlr
-  plymouth
-  python python-gobject gtk3 gtk-layer-shell gnome-themes-extra adwaita-icon-theme
-  gstreamer gst-plugins-base gst-plugins-good gst-plugins-bad gst-plugins-ugly gstreamer-vaapi
-  sqlite qrencode
+  networkmanager iwd wpa_supplicant
   bluez bluez-utils
-  socat psmisc procps
+  pipewire wireplumber pipewire-audio
+  sway foot xorg-xwayland
+  xdg-desktop-portal xdg-desktop-portal-wlr
+  gstreamer gst-plugins-base gst-plugins-good gst-plugins-bad gst-plugins-ugly
   base-devel
 )
 
@@ -454,33 +434,20 @@ if [[ "$SWAP_G" != "0" ]]; then
     echo "/swapfile none swap defaults 0 0" >> "$MNT/etc/fstab"
   else
     mkdir -p "$MNT/swap"
-    if arch-chroot "$MNT" bash -lc 'btrfs filesystem mkswapfile -h' >/dev/null 2>&1; then
-      arch-chroot "$MNT" bash -lc "btrfs filesystem mkswapfile --size ${SWAP_G}G /swap/swapfile"
-    else
-      chattr +C "$MNT/swap" || true
-      fallocate -l "${SWAP_G}G" "$MNT/swap/swapfile"
-      chmod 600 "$MNT/swap/swapfile"
-      mkswap "$MNT/swap/swapfile"
-    fi
+    chattr +C "$MNT/swap" || true
+    fallocate -l "${SWAP_G}G" "$MNT/swap/swapfile"
+    chmod 600 "$MNT/swap/swapfile"
+    mkswap "$MNT/swap/swapfile"
     echo "/swap/swapfile none swap defaults 0 0" >> "$MNT/etc/fstab"
   fi
 fi
 
-# Persist flags
-mkdir -p "$MNT/var/lib/drapbox"
-echo "$ATV_VARIANT" > "$MNT/var/lib/drapbox/waydroid_variant"
-echo "$AUTOSWITCH"  > "$MNT/var/lib/drapbox/autoswitch"
-echo "$HWACCEL"     > "$MNT/var/lib/drapbox/hwaccel"
-
-# =============================================================================
-# Fetch firstboot script now (so it's embedded into installed system)
-# =============================================================================
+# ---- Fetch firstboot now so it's embedded ----
 FIRSTBOOT_URL="${FIRSTBOOT_URL:-https://raw.githubusercontent.com/DrapNard/DrapBox/refs/heads/main/firstboot.sh}"
 mkdir -p "$MNT/usr/lib/drapbox"
 curl -fsSL "$FIRSTBOOT_URL" -o "$MNT/usr/lib/drapbox/firstboot.sh"
 chmod 0755 "$MNT/usr/lib/drapbox/firstboot.sh"
 
-# Firstboot service
 cat >"$MNT/etc/systemd/system/drapbox-firstboot.service" <<'EOF'
 [Unit]
 Description=DrapBox First Boot Wizard
@@ -489,47 +456,22 @@ Wants=NetworkManager.service bluetooth.service
 
 [Service]
 Type=oneshot
-ExecStart=/usr/lib/drapbox/firstboot.sh
+ExecStart=/usr/lib/drapbox/firstboot.sh --firstboot
 RemainAfterExit=yes
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-# Overlay menu script (calls firstboot menu)
-cat >"$MNT/usr/lib/drapbox/overlay.sh" <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-exec /usr/lib/drapbox/firstboot.sh --overlay
-EOF
-chmod 0755 "$MNT/usr/lib/drapbox/overlay.sh"
-
-# =============================================================================
-# Chroot: system config + paru-bin + AUR packages + enable firstboot
-# =============================================================================
+# ---- Chroot config (incl. repo paru, fallback aur paru) ----
 cat >"$MNT/root/drapbox-chroot.sh" <<'CHROOT'
 #!/usr/bin/env bash
 set -euo pipefail
 die(){ echo "✗ $*" >&2; exit 1; }
 
-HOSTNAME="$1"; USERNAME="$2"; USERPASS="$3"; ROOTPASS="$4"; TZ="$5"; LOCALE="$6"; KEYMAP="$7"; AUTOLOGIN="$8"; FS="$9"
+HOSTNAME="$1"; USERNAME="$2"; USERPASS="$3"; ROOTPASS="$4"; TZ="$5"; LOCALE="$6"; KEYMAP="$7"; FS="$8"
 
-echo "[chroot] configuring base system..."
-
-# pacman.conf: keep directives inside [options]
-# remove broken global ILoveCandy if it exists at top before sections
-sed -i '1{/^ILoveCandy$/d}' /etc/pacman.conf || true
-grep -q '^\[options\]$' /etc/pacman.conf || die "pacman.conf missing [options]"
-
-# ILoveCandy under [options]
-grep -q '^ILoveCandy$' /etc/pacman.conf || sed -i '/^\[options\]$/a ILoveCandy' /etc/pacman.conf
-
-# ParallelDownloads
-if grep -q '^[# ]*ParallelDownloads' /etc/pacman.conf; then
-  sed -i 's/^[# ]*ParallelDownloads.*/ParallelDownloads = 10/' /etc/pacman.conf
-else
-  sed -i '/^\[options\]$/a ParallelDownloads = 10' /etc/pacman.conf
-fi
+echo "[chroot] base config..."
 
 ln -sf "/usr/share/zoneinfo/$TZ" /etc/localtime
 hwclock --systohc
@@ -557,24 +499,13 @@ systemctl enable iwd
 systemctl enable bluetooth
 systemctl enable drapbox-firstboot.service
 
-# Plymouth
-if grep -q '^HOOKS=' /etc/mkinitcpio.conf; then
-  grep -q 'plymouth' /etc/mkinitcpio.conf || sed -i 's/^HOOKS=(\(.*\))/HOOKS=(\1 plymouth)/' /etc/mkinitcpio.conf
-fi
-mkdir -p /etc/plymouth
-cat >/etc/plymouth/plymouthd.conf <<EOF
-[Daemon]
-Theme=spinner
-ShowDelay=0
-EOF
-mkinitcpio -P
-
 # systemd-boot
 bootctl install
 ROOT_UUID="$(blkid -s UUID -o value "$(findmnt -no SOURCE /)")"
-CMDLINE="quiet splash loglevel=3 rd.systemd.show_status=auto rd.udev.log_level=3 vt.global_cursor_default=0"
+CMDLINE="quiet loglevel=3 rd.systemd.show_status=auto rd.udev.log_level=3 vt.global_cursor_default=0"
 if [[ "$FS" == "btrfs" ]]; then CMDLINE="$CMDLINE rootflags=subvol=@"; fi
 
+mkdir -p /boot/loader/entries
 cat >/boot/loader/loader.conf <<EOF
 default drapbox.conf
 timeout 0
@@ -588,96 +519,53 @@ initrd /initramfs-linux.img
 options root=UUID=$ROOT_UUID rw $CMDLINE
 EOF
 
-cat >/boot/loader/entries/drapbox-rescue.conf <<EOF
-title DrapBox (rescue terminal)
-linux /vmlinuz-linux
-initrd /initramfs-linux.img
-options root=UUID=$ROOT_UUID rw systemd.unit=multi-user.target loglevel=4
-EOF
-
-# Env defaults
-mkdir -p /etc/environment.d
-cat >/etc/environment.d/90-drapbox.conf <<'EOF'
-GTK_THEME=Adwaita:dark
-GDK_BACKEND=wayland
-EOF
-
-# User config skeleton
-UHOME="$(getent passwd "$USERNAME" | cut -d: -f6)"
-install -d "$UHOME/.config/gtk-3.0" "$UHOME/.config/sway"
-chown -R "$USERNAME:$USERNAME" "$UHOME/.config"
-
-cat >"$UHOME/.config/gtk-3.0/settings.ini" <<'EOF'
-[Settings]
-gtk-theme-name=Adwaita-dark
-gtk-icon-theme-name=Adwaita
-gtk-application-prefer-dark-theme=1
-EOF
-chown "$USERNAME:$USERNAME" "$UHOME/.config/gtk-3.0/settings.ini"
-
-# Basic sway binding for overlay (mod+o)
-# (you can change later)
-if [[ ! -f "$UHOME/.config/sway/config" ]]; then
-  cat >"$UHOME/.config/sway/config" <<'EOF'
-set $mod Mod4
-bindsym $mod+Return exec foot
-bindsym $mod+o exec foot -a drapbox-overlay -- bash -lc /usr/lib/drapbox/overlay.sh
-EOF
-  chown "$USERNAME:$USERNAME" "$UHOME/.config/sway/config"
-fi
-
-# --- IMPORTANT: ensure pacman/libalpm matches paru-bin ---
+# --- IMPORTANT: full sync so pacman/libalpm consistent ---
 pacman -Sy --noconfirm archlinux-keyring
 pacman -Syu --noconfirm
-# ensure pacman present (brings libalpm)
-pacman -S --noconfirm pacman
 
+# Try install paru from repo first (best, no libalpm mismatch)
+if pacman -S --noconfirm --needed paru; then
+  echo "[chroot] paru installed from repo."
+else
+  echo "[chroot] paru not in repo -> building from AUR (source) ..."
+  pacman -S --noconfirm --needed git base-devel
 
-# =============================================================================
-# AUR via paru-bin (install non-debug package explicitly)
-# =============================================================================
-echo "[chroot] installing paru-bin + AUR packages..."
+  # allow pacman without password only during build
+  echo '%wheel ALL=(ALL:ALL) NOPASSWD: /usr/bin/pacman, /usr/bin/pacman-key' >/etc/sudoers.d/99-drapbox-pacman
+  chmod 440 /etc/sudoers.d/99-drapbox-pacman
 
-pacman -Sy --noconfirm --needed archlinux-keyring git base-devel
-pacman-key --populate archlinux >/dev/null 2>&1 || true
+  BUILD_DIR="/tmp/aur-build"
+  rm -rf "$BUILD_DIR"; mkdir -p "$BUILD_DIR"
+  chown -R "$USERNAME:$USERNAME" "$BUILD_DIR"
 
-# allow pacman without password for wheel (only during build)
-echo '%wheel ALL=(ALL:ALL) NOPASSWD: /usr/bin/pacman, /usr/bin/pacman-key' >/etc/sudoers.d/99-drapbox-pacman
-chmod 440 /etc/sudoers.d/99-drapbox-pacman
+  su - "$USERNAME" -c "cd '$BUILD_DIR' && rm -rf paru && git clone https://aur.archlinux.org/paru.git"
+  su - "$USERNAME" -c "cd '$BUILD_DIR/paru' && makepkg -s --noconfirm --needed"
+  PKG="$(ls -1 "$BUILD_DIR/paru"/paru-[0-9]*-x86_64.pkg.tar.* 2>/dev/null | tail -n1)"
+  [[ -f "$PKG" ]] || die "paru package not built"
+  pacman -U --noconfirm --needed "$PKG"
 
-BUILD_DIR="/tmp/aur-build"
-rm -rf "$BUILD_DIR"
-mkdir -p "$BUILD_DIR"
-chown -R "$USERNAME:$USERNAME" "$BUILD_DIR"
+  rm -f /etc/sudoers.d/99-drapbox-pacman
+fi
 
-su - "$USERNAME" -c "cd '$BUILD_DIR' && rm -rf paru-bin && git clone https://aur.archlinux.org/paru-bin.git"
-# build ONLY (no -i), then install correct pkg via pacman -U
-su - "$USERNAME" -c "cd '$BUILD_DIR/paru-bin' && makepkg -s --noconfirm --needed"
+command -v paru >/dev/null 2>&1 || die "paru missing"
 
-PKG="$(ls -1 "$BUILD_DIR/paru-bin"/paru-bin-[0-9]*-x86_64.pkg.tar.* 2>/dev/null | tail -n1)"
-[[ -f "$PKG" ]] || die "paru-bin package not built (expected non-debug pkg)"
-pacman -U --noconfirm --needed "$PKG"
-
-command -v paru >/dev/null 2>&1 || die "paru not found after install"
-
-# Prefer -bin packages when possible
-AUR_PKGS=(
-  uxplay-bin
-  # gnome-network-displays is repo on some setups, aur on others; paru handles both
-  gnome-network-displays
-)
-
-# non interactive
-su - "$USERNAME" -c "paru -S --noconfirm --needed --skipreview ${AUR_PKGS[*]}"
-
-rm -f /etc/sudoers.d/99-drapbox-pacman
+# Install repo packages first, fallback to paru if missing
+want_repo=(uxplay gnome-network-displays)
+for p in "${want_repo[@]}"; do
+  if pacman -S --noconfirm --needed "$p"; then
+    echo "[chroot] repo ok: $p"
+  else
+    echo "[chroot] repo missing -> paru: $p"
+    su - "$USERNAME" -c "paru -S --noconfirm --needed --skipreview $p"
+  fi
+done
 
 echo "[chroot] done."
 CHROOT
 
 chmod +x "$MNT/root/drapbox-chroot.sh"
 arch-chroot "$MNT" /root/drapbox-chroot.sh \
-  "$HOSTNAME" "$USERNAME" "$USERPASS" "$ROOTPASS" "$TZ" "$LOCALE" "$KEYMAP" "$AUTOLOGIN" "$FS"
+  "$HOSTNAME" "$USERNAME" "$USERPASS" "$ROOTPASS" "$TZ" "$LOCALE" "$KEYMAP" "$FS"
 
 echo
 echo "✅ Install complete."
