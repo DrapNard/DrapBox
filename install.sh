@@ -538,13 +538,13 @@ else
   rm -rf "$BUILD_DIR"; mkdir -p "$BUILD_DIR"
   chown -R "$USERNAME:$USERNAME" "$BUILD_DIR"
 
-  su - "$USERNAME" -c "cd '$BUILD_DIR' && rm -rf paru && git clone https://aur.archlinux.org/paru-bin.git"
-  su - "$USERNAME" -c "cd '$BUILD_DIR/paru-bin' && makepkg -si --noconfirm --needed"
+  su - "$USERNAME" -c "cd '$BUILD_DIR' && rm -rf yay-bin && git clone https://aur.archlinux.org/yay-bin.git"
+  su - "$USERNAME" -c "cd '$BUILD_DIR/yay-bin' && makepkg -si --noconfirm --needed"
   
   rm -f /etc/sudoers.d/99-drapbox-pacman
 fi
 
-command -v paru >/dev/null 2>&1 || die "paru missing"
+command -v yay >/dev/null 2>&1 || die "yay missing"
 
 # Install repo packages first, fallback to paru if missing
 want_repo=(uxplay gnome-network-displays)
@@ -552,8 +552,8 @@ for p in "${want_repo[@]}"; do
   if pacman -S --noconfirm --needed "$p"; then
     echo "[chroot] repo ok: $p"
   else
-    echo "[chroot] repo missing -> paru: $p"
-    su - "$USERNAME" -c "paru -S --noconfirm --needed --skipreview $p"
+    echo "[chroot] repo missing -> yay: $p"
+    su - "$USERNAME" -c "yay -S --noconfirm --needed --skipreview $p"
   fi
 done
 
