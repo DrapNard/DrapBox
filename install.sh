@@ -329,7 +329,25 @@ pick_disk() {
     _tty_echo "NAME        SIZE   MODEL"
     _tty_echo "-------------------------------------------"
 
-    mapfile -t disks < <(lsblk -dn -o NAME,SIZE,MODEL,TYPE | awk '$4=="disk"{printf "/dev/%s\t%s\t%s\n",$1,$2,$3}')
+mapfile -t disks < <(
+  lsblk -dn -o NAME,TYPE,SIZE,MODEL -P |
+  awk '
+    $0 ~ /TYPE="disk"/ {
+      # parse KEY="VAL" pairs safely
+      name=""; size=""; model=""
+      for (i=1;i<=NF;i++){
+        if ($i ~ /^NAME=/){ gsub(/NAME=|"/,"",$i); name=$i }
+        if ($i ~ /^SIZE=/){ gsub(/SIZE=|"/,"",$i); size=$i }
+        if ($i ~ /^MODEL=/){
+          # MODEL may be quoted with spaces, but -P keeps it as one field
+          gsub(/MODEL=|"/,"",$i); model=$i
+        }
+      }
+      printf "/dev/%s\t%s\t%s\n", name, size, model
+    }
+  '
+)
+
     ((${#disks[@]})) || die "No disks found."
 
     local i=0
