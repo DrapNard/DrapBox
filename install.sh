@@ -468,13 +468,29 @@ echo "$HWACCEL"     > "$MNT/var/lib/drapbox/hwaccel"
 cat >"$MNT/root/drapbox-chroot.sh" <<'CHROOT'
 #!/usr/bin/env bash
 set -euo pipefail
+die(){ echo "✗ $*" >&2; exit 1; }
+
 HOSTNAME="$1"; USERNAME="$2"; USERPASS="$3"; ROOTPASS="$4"; TZ="$5"; LOCALE="$6"; KEYMAP="$7"; AUTOLOGIN="$8"; FS="$9"
 
 echo "[chroot] configuring base system..."
 
-# pacman.conf: ILoveCandy must be GLOBAL (not in [extra]/[core])
-grep -q '^ILoveCandy$' /etc/pacman.conf || sed -i '1iILoveCandy\n' /etc/pacman.conf
-sed -i 's/^#ParallelDownloads.*/ParallelDownloads = 10/' /etc/pacman.conf || true
+# -----------------------------------------------------------------------------
+# pacman.conf: keep directives inside [options] (NEVER before any section)
+# -----------------------------------------------------------------------------
+# Remove a broken ILoveCandy if it was inserted at file top previously
+sed -i '1{/^ILoveCandy$/d}' /etc/pacman.conf
+
+grep -q '^\[options\]$' /etc/pacman.conf || die "pacman.conf missing [options] section"
+
+# Ensure ILoveCandy is under [options]
+grep -q '^ILoveCandy$' /etc/pacman.conf || sed -i '/^\[options\]$/a ILoveCandy' /etc/pacman.conf
+
+# ParallelDownloads = 10 under [options] (replace commented or existing)
+if grep -q '^[#[:space:]]*ParallelDownloads' /etc/pacman.conf; then
+  sed -i 's/^[#[:space:]]*ParallelDownloads.*/ParallelDownloads = 10/' /etc/pacman.conf
+else
+  sed -i '/^\[options\]$/a ParallelDownloads = 10' /etc/pacman.conf
+fi
 
 ln -sf "/usr/share/zoneinfo/$TZ" /etc/localtime
 hwclock --systohc
@@ -493,17 +509,13 @@ cat >/etc/hosts <<EOF
 EOF
 
 echo "root:$ROOTPASS" | chpasswd
-useradd -m -G wheel -s /bin/bash "$USERNAME"
+id -u "$USERNAME" >/dev/null 2>&1 || useradd -m -G wheel -s /bin/bash "$USERNAME"
 echo "$USERNAME:$USERPASS" | chpasswd
 sed -i 's/^# %wheel ALL=(ALL:ALL) ALL/%wheel ALL=(ALL:ALL) ALL/' /etc/sudoers
 
-systemctl enable NetworkManager
-systemctl enable iwd
-systemctl enable bluetooth
-
-# allow pacman without password temporarily (needed for makepkg/paru non-interactive)
-echo '%wheel ALL=(ALL:ALL) NOPASSWD: /usr/bin/pacman, /usr/bin/pacman-key' >/etc/sudoers.d/99-drapbox-pacman
-chmod 440 /etc/sudoers.d/99-drapbox-pacman
+systemctl enable NetworkManager || true
+systemctl enable iwd || true
+systemctl enable bluetooth || true
 
 # Plymouth
 if grep -q '^HOOKS=' /etc/mkinitcpio.conf; then
@@ -518,11 +530,12 @@ EOF
 mkinitcpio -P
 
 # systemd-boot
-bootctl install
+bootctl install || true
 ROOT_UUID="$(blkid -s UUID -o value "$(findmnt -no SOURCE /)")"
 CMDLINE="quiet splash loglevel=3 rd.systemd.show_status=auto rd.udev.log_level=3 vt.global_cursor_default=0"
 if [[ "$FS" == "btrfs" ]]; then CMDLINE="$CMDLINE rootflags=subvol=@"; fi
 
+mkdir -p /boot/loader/entries
 cat >/boot/loader/loader.conf <<EOF
 default drapbox.conf
 timeout 0
@@ -550,7 +563,7 @@ GTK_THEME=Adwaita:dark
 GDK_BACKEND=wayland
 EOF
 
-loginctl enable-linger "$USERNAME" || true
+loginctl enable-linger "$USERNAME" >/dev/null 2>&1 || true
 
 UHOME="$(getent passwd "$USERNAME" | cut -d: -f6)"
 install -d "$UHOME/.config/gtk-3.0" "$UHOME/.config/sway"
@@ -564,9 +577,9 @@ gtk-application-prefer-dark-theme=1
 EOF
 chown "$USERNAME:$USERNAME" "$UHOME/.config/gtk-3.0/settings.ini"
 
-# =============================================================================
-# AUR via paru-bin (prefer -bin packages)
-# =============================================================================
+# -----------------------------------------------------------------------------
+# AUR via paru-bin (build as user, install as root => no sudo prompt)
+# -----------------------------------------------------------------------------
 echo "[chroot] installing paru-bin + AUR packages..."
 
 pacman -Sy --noconfirm --needed archlinux-keyring git base-devel
@@ -577,21 +590,22 @@ rm -rf "$BUILD_DIR"
 mkdir -p "$BUILD_DIR"
 chown -R "$USERNAME:$USERNAME" "$BUILD_DIR"
 
-# build/install paru-bin as user (makepkg will sudo pacman, but NOPASSWD allows it)
 su - "$USERNAME" -c "cd '$BUILD_DIR' && rm -rf paru-bin && git clone https://aur.archlinux.org/paru-bin.git"
-su - "$USERNAME" -c "cd '$BUILD_DIR/paru-bin' && makepkg -si --noconfirm --needed"
+su - "$USERNAME" -c "cd '$BUILD_DIR/paru-bin' && makepkg -s --noconfirm --needed"
 
-# AUR packages (use -bin)
+# install the built package as root
+PKG="$(ls -1 "$BUILD_DIR/paru-bin"/paru-bin-*.pkg.tar.* | tail -n1)"
+[[ -n "${PKG:-}" && -f "$PKG" ]] || die "paru-bin package not built"
+pacman -U --noconfirm --needed "$PKG"
+
+# AUR packages (prefer -bin)
 AUR_PKGS=(
   uxplay-bin
   gnome-network-displays
 )
 
-# non-interactive install
+# non-interactive AUR install (now paru exists, still no password prompts)
 su - "$USERNAME" -c "paru -S --noconfirm --needed --skipreview ${AUR_PKGS[*]}"
-
-# optional: tighten sudo again
-rm -f /etc/sudoers.d/99-drapbox-pacman
 
 echo "[chroot] AUR install done."
 CHROOT
