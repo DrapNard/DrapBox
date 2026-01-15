@@ -15,6 +15,36 @@ need pacman
 need curl
 
 export TERM="${TERM:-linux}"
+TTY_DEV="/dev/tty"
+
+_tty_echo(){ printf "%b\n" "$*" >"$TTY_DEV"; }
+_tty_readline(){
+  local prompt="$1" default="${2:-}" ans=""
+  printf "%b" "$prompt" >"$TTY_DEV"
+  IFS= read -r ans <"$TTY_DEV" || true
+  [[ -n "$ans" ]] && printf "%s" "$ans" || printf "%s" "$default"
+}
+
+# =============================================================================
+# Bootstrap: always run from a real file under bash (fixes /dev/fd weirdness)
+# =============================================================================
+SCRIPT_URL="${SCRIPT_URL:-https://raw.githubusercontent.com/DrapNard/DrapBox/refs/heads/main/install.sh}"
+SELF="${SELF:-/run/drapbox/installer.sh}"
+BOOTSTRAPPED="${BOOTSTRAPPED:-0}"
+
+if (( BOOTSTRAPPED == 0 )); then
+  mkdir -p /run/drapbox
+  curl -fsSL "$SCRIPT_URL" -o "$SELF"
+  chmod +x "$SELF"
+  exec /usr/bin/env -i \
+    BOOTSTRAPPED=1 \
+    SCRIPT_URL="$SCRIPT_URL" \
+    SELF="$SELF" \
+    LOG_FILE="${LOG_FILE:-}" \
+    TERM="${TERM:-linux}" \
+    PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+    bash "$SELF" "$@"
+fi
 
 # =============================================================================
 # Logging
@@ -26,21 +56,6 @@ exec > >(tee -a "$LOG_FILE") 2>&1
 echo "=== DrapBox installer log: $LOG_FILE ==="
 echo "Started: $(date -Is)"
 echo
-
-# =============================================================================
-# Robust launcher (works with bash <(curl ...))
-# =============================================================================
-SCRIPT_URL="${SCRIPT_URL:-https://raw.githubusercontent.com/DrapNard/DrapBox/refs/heads/main/install.sh}"
-SELF="${SELF:-/run/drapbox-installer.sh}"
-
-_snapshot_self() {
-  mkdir -p "$(dirname "$SELF")"
-  [[ -s "$SELF" ]] && return 0
-  if [[ -r "${0:-}" ]]; then cat "$0" > "$SELF" 2>/dev/null || true; fi
-  [[ -s "$SELF" ]] || curl -fsSL "$SCRIPT_URL" -o "$SELF"
-  chmod +x "$SELF"
-}
-_snapshot_self
 
 # =============================================================================
 # RAM-root overlay (archiso cow space workaround)
@@ -74,7 +89,6 @@ enter_ramroot_overlay() {
   fi
 
   mkdir -p /run/drapbox-ramroot/{lower,merged,tmp}
-
   mountpoint -q /run/drapbox-ramroot/lower || mount --rbind / /run/drapbox-ramroot/lower
   mount --make-rprivate /run/drapbox-ramroot/lower || true
 
@@ -93,9 +107,7 @@ enter_ramroot_overlay() {
   mount --bind /tmp  /run/drapbox-ramroot/merged/tmp
 
   install -m 0755 "$SELF" /run/drapbox-ramroot/merged/tmp/drapbox-run
-
-  export IN_RAMROOT=1
-  export LOG_FILE LOG_DIR SCRIPT_URL SELF TERM
+  export IN_RAMROOT=1 LOG_FILE LOG_DIR SCRIPT_URL SELF TERM
   exec chroot /run/drapbox-ramroot/merged /tmp/drapbox-run
 }
 
@@ -125,7 +137,6 @@ maybe_use_ramroot() {
 fix_system_after_overlay() {
   [[ "${IN_RAMROOT:-0}" == "1" ]] || return 0
   echo "• [ramroot] Fixing system state after overlay…"
-
   mkdir -p /var/lib/pacman /var/cache/pacman/pkg /etc/pacman.d /tmp
   chmod 1777 /tmp
   [[ -e /etc/resolv.conf ]] || echo "nameserver 1.1.1.1" > /etc/resolv.conf
@@ -139,55 +150,109 @@ fix_system_after_overlay() {
 
   systemctl start haveged >/dev/null 2>&1 || true
   systemctl start rngd    >/dev/null 2>&1 || true
-
   pacman-key --init >/dev/null 2>&1 || true
   pacman-key --populate archlinux >/dev/null 2>&1 || true
-
   echo "• [ramroot] Done."
 }
 
 # =============================================================================
-# Minimal UI (plain prompts)
+# Simple CLI UI (no whiptail dependency)
 # =============================================================================
-TTY_DEV="/dev/tty"
-
-_tty_read() {
-  local prompt="$1" default="${2:-}"
-  local ans=""
-  if [[ -r "$TTY_DEV" && -w "$TTY_DEV" ]]; then
-    printf "%s" "$prompt" >"$TTY_DEV"
-    IFS= read -r ans <"$TTY_DEV" || true
-  else
-    printf "%s" "$prompt"
-    IFS= read -r ans || true
-  fi
-  [[ -n "$ans" ]] && printf "%s" "$ans" || printf "%s" "$default"
+ui_msg(){
+  _tty_echo ""
+  _tty_echo "== $APP =="
+  _tty_echo "$1"
+  _tty_echo "Log: $LOG_FILE"
+  _tty_readline "Press Enter to continue..." "" >/dev/null
 }
 
-msg() {
-  local t="$1"
-  echo
-  echo "== $APP =="
-  echo -e "$t"
-  echo "Log: $LOG_FILE"
-  echo
+ui_yesno(){
+  local ans
+  ans="$(_tty_readline "$1 [y/N]: " "")"
+  [[ "${ans,,}" == "y" || "${ans,,}" == "yes" ]]
 }
 
-yesno() {
-  local q="$1"
-  local a="$(_tty_read "$q [y/N]: " "")"
-  [[ "${a,,}" == "y" || "${a,,}" == "yes" ]]
+ui_input(){
+  local msg="$1" def="${2:-}"
+  _tty_readline "$msg [$def]: " "$def"
 }
 
-input() {
-  local q="$1" def="${2:-}"
-  _tty_read "$q [$def]: " "$def"
+ui_pass(){
+  local msg="$1"
+  _tty_echo "(!) Password input is visible in pure CLI mode."
+  _tty_readline "$msg: " ""
 }
 
-pass() {
-  local q="$1"
-  echo "(!) Password will be visible in this CLI mode."
-  _tty_read "$q: " ""
+# =============================================================================
+# Disk picker (robust)
+# =============================================================================
+pick_disk(){
+  while true; do
+    _tty_echo ""
+    _tty_echo "=== Disks detected (target will be WIPED) ==="
+    _tty_echo "NAME        SIZE   MODEL"
+    _tty_echo "-------------------------------------------"
+
+    mapfile -t disks < <(
+      lsblk -dn -o NAME,TYPE,SIZE,MODEL -P |
+      awk '
+        $0 ~ /TYPE="disk"/ {
+          name=""; size=""; model=""
+          for (i=1;i<=NF;i++){
+            if ($i ~ /^NAME=/){ gsub(/NAME=|"/,"",$i); name=$i }
+            if ($i ~ /^SIZE=/){ gsub(/SIZE=|"/,"",$i); size=$i }
+            if ($i ~ /^MODEL=/){ gsub(/MODEL=|"/,"",$i); model=$i }
+          }
+          printf "/dev/%s\t%s\t%s\n", name, size, model
+        }'
+    )
+
+    if ((${#disks[@]}==0)); then
+      _tty_echo "x No disks found via -P parsing, trying fallback..."
+      mapfile -t disks < <(lsblk -dn -o NAME,TYPE,SIZE | awk '$2=="disk"{printf "/dev/%s\t%s\t\n",$1,$3}')
+    fi
+
+    ((${#disks[@]})) || die "No disks found."
+
+    local i=0 paths=()
+    for line in "${disks[@]}"; do
+      i=$((i+1))
+      local dev size model
+      dev="$(awk '{print $1}' <<<"$line")"
+      size="$(awk '{print $2}' <<<"$line")"
+      model="$(cut -f3- <<<"$line" | sed 's/[[:space:]]\+/ /g')"
+      paths+=("$dev")
+      printf "%2d) %-10s %-6s %s\n" "$i" "$dev" "$size" "$model" >"$TTY_DEV"
+    done
+
+    _tty_echo ""
+    local choice
+    choice="$(_tty_readline "Select disk number [1-$i] (or 'r' refresh): " "")"
+    [[ -z "$choice" ]] && continue
+    [[ "${choice,,}" == "r" ]] && continue
+    [[ "$choice" =~ ^[0-9]+$ ]] || continue
+    (( choice>=1 && choice<=i )) || continue
+
+    local d="${paths[$((choice-1))]}"
+    [[ -b "$d" ]] || { _tty_echo "x Selected: $d is not a block device."; continue; }
+    ui_yesno "Confirm WIPE target: $d ?" || continue
+    echo "$d"
+    return 0
+  done
+}
+
+unmount_disk_everything() {
+  local disk="$1"
+  # unmount anything mounted from this disk (partitions)
+  while read -r src mp _; do
+    [[ -n "$mp" ]] || continue
+    echo "• Unmounting $src from $mp"
+    umount -l "$mp" >/dev/null 2>&1 || true
+  done < <(findmnt -rn -S "${disk}*" -o SOURCE,TARGET,FSTYPE 2>/dev/null || true)
+
+  # also unmount our target mount if present
+  umount -R "$MNT" >/dev/null 2>&1 || true
+  swapoff -a >/dev/null 2>&1 || true
 }
 
 # =============================================================================
@@ -204,80 +269,41 @@ ensure_network(){
   systemctl start NetworkManager >/dev/null 2>&1 || true
 
   while ! is_online; do
-    msg "No internet detected.\n1) Retry\n2) WiFi (iwctl)\n3) Shell\n4) Abort"
-    local c="$(_tty_read "Select [1-4]: " "1")"
+    _tty_echo ""
+    _tty_echo "No internet detected."
+    _tty_echo " 1) Retry"
+    _tty_echo " 2) Wi-Fi (iwctl)"
+    _tty_echo " 3) Shell"
+    _tty_echo " 4) Abort"
+    local c
+    c="$(_tty_readline "Select [1-4]: " "")"
     case "$c" in
       1) ;;
       2)
-        need iwctl || die "iwctl not found"
+        need iwctl || die "iwctl missing"
         local wlan ssid psk
         wlan="$(ls /sys/class/net 2>/dev/null | grep -E '^(wl|wlan)' | head -n1 || true)"
-        [[ -n "$wlan" ]] || { msg "No Wi-Fi interface."; continue; }
-        ssid="$(input "SSID for $wlan" "")"
+        [[ -n "$wlan" ]] || { ui_msg "No Wi-Fi interface detected."; continue; }
+        ssid="$(ui_input "SSID for $wlan:" "")"
         [[ -n "$ssid" ]] || continue
-        psk="$(pass "Password for '$ssid' (empty=open)")"
+        psk="$(ui_pass "Password for '$ssid' (empty=open)")"
         iwctl device "$wlan" set-property Powered on >/dev/null 2>&1 || true
         iwctl station "$wlan" scan >/dev/null 2>&1 || true
         sleep 1
         if [[ -n "$psk" ]]; then
-          iwctl --passphrase "$psk" station "$wlan" connect "$ssid" >/dev/null 2>&1 || msg "WiFi failed."
+          iwctl --passphrase "$psk" station "$wlan" connect "$ssid" >/dev/null 2>&1 || ui_msg "Wi-Fi failed."
         else
-          iwctl station "$wlan" connect "$ssid" >/dev/null 2>&1 || msg "WiFi failed."
+          iwctl station "$wlan" connect "$ssid" >/dev/null 2>&1 || ui_msg "Wi-Fi failed."
         fi
         ;;
-      3) msg "Shell. Type exit to return."; bash || true ;;
+      3)
+        ui_msg "Shell opened. Type 'exit' to return."
+        bash || true
+        ;;
       4) die "Aborted" ;;
       *) ;;
     esac
   done
-}
-
-# =============================================================================
-# Disk selection (robust)
-# =============================================================================
-list_disks() {
-  lsblk -dnpo NAME,SIZE,MODEL,TYPE | awk '$4=="disk"{printf "%-18s %-8s %s\n",$1,$2,$3}'
-}
-
-pick_disk_plain() {
-  echo
-  echo "=== Disks detected (target WILL be WIPED) ==="
-  echo "NAME               SIZE     MODEL"
-  echo "---------------------------------------------"
-  local disks=()
-  while IFS= read -r line; do
-    [[ -n "$line" ]] || continue
-    echo "$line"
-    disks+=("$(awk '{print $1}' <<<"$line")")
-  done < <(list_disks)
-
-  ((${#disks[@]})) || return 1
-
-  echo
-  local d="$(_tty_read "Type disk path (ex: /dev/sda): " "")"
-  echo "$d"
-}
-
-validate_disk() {
-  local d="$1"
-  [[ "$d" =~ ^/dev/ ]] || die "Invalid disk selection: '$d'"
-  [[ -b "$d" ]] || die "Not a block device: '$d'"
-}
-
-# =============================================================================
-# Repo filter helper
-# =============================================================================
-pkg_in_repos() { pacman -Si "$1" >/dev/null 2>&1; }
-filter_existing_pkgs() {
-  local out=()
-  for p in "$@"; do
-    if pkg_in_repos "$p"; then
-      out+=("$p")
-    else
-      echo "[warn] repo-missing: $p (skip)"
-    fi
-  done
-  printf "%s\n" "${out[@]}"
 }
 
 # =============================================================================
@@ -286,77 +312,76 @@ filter_existing_pkgs() {
 maybe_use_ramroot
 fix_system_after_overlay
 
-# baseline tools in live
+# Keyring baseline (idempotent)
 pacman -Sy --noconfirm --needed archlinux-keyring >/dev/null 2>&1 || true
 pacman-key --populate archlinux >/dev/null 2>&1 || true
 
-# minimal live deps (per your note)
+# Minimal live deps (NETWORK = iwd + networkmanager ONLY)
 pacman -Sy --noconfirm --needed \
   iwd networkmanager \
   gptfdisk util-linux dosfstools e2fsprogs btrfs-progs \
   arch-install-scripts \
-  curl git \
+  curl git jq \
   >/dev/null
 
-msg "Welcome.\nThis will install DrapBox.\nStep 1: Internet check."
+ui_msg "Welcome.\n\nThis will install DrapBox.\n\nStep 1: Internet check."
 ensure_network
 
-DISK="$(pick_disk_plain)" || die "No disks found."
-validate_disk "$DISK"
+DISK="$(pick_disk)" || die "No disk selected"
+HOSTNAME="$(ui_input "Hostname (also AirPlay name):" "drapbox")"
+USERNAME="$(ui_input "Admin user (sudo):" "drapnard")"
+USERPASS="$(ui_pass "Password for user '$USERNAME'")"
+ROOTPASS="$(ui_pass "Password for root")"
+TZ="$(ui_input "Timezone (e.g. Europe/Paris):" "Europe/Paris")"
+LOCALE="$(ui_input "Locale (e.g. en_US.UTF-8, fr_FR.UTF-8):" "en_US.UTF-8")"
+KEYMAP="$(ui_input "Keymap (e.g. us, fr, de):" "us")"
 
-HOSTNAME="$(input "Hostname (AirPlay name)" "drapbox")"
-USERNAME="$(input "Admin user (sudo)" "drapnard")"
-USERPASS="$(pass "Password for user '$USERNAME'")"
-ROOTPASS="$(pass "Password for root")"
+FS="$(ui_input "Root FS (ext4/btrfs):" "ext4")"
+[[ "$FS" == "ext4" || "$FS" == "btrfs" ]] || die "Invalid FS: $FS"
 
-TZ="$(input "Timezone (ex: Europe/Paris)" "Europe/Paris")"
-LOCALE="$(input "Locale (ex: en_US.UTF-8, fr_FR.UTF-8)" "en_US.UTF-8")"
-KEYMAP="$(input "Keymap (ex: us, fr, de)" "us")"
+SWAP_G="$(ui_input "Swapfile size GiB (0=none):" "0")"
+[[ "$SWAP_G" =~ ^[0-9]+$ ]] || die "Invalid swap size: $SWAP_G"
 
-FS="$(input "FS (ext4/btrfs)" "ext4")"
-[[ "$FS" == "ext4" || "$FS" == "btrfs" ]] || die "FS must be ext4 or btrfs"
+ATV_VARIANT="$(ui_input "Waydroid variant (GAPPS/VANILLA):" "GAPPS")"
+AUTOSWITCH="$(ui_input "Auto-switch (ON/OFF):" "ON")"
+HWACCEL="$(ui_input "HW decode (ON/OFF):" "ON")"
 
-SWAP_G="$(input "Swap GiB (0,2,4,8,12,16)" "0")"
-ATV_VARIANT="$(input "Waydroid variant (GAPPS/VANILLA)" "GAPPS")"
-AUTOSWITCH="$(input "Auto-switch (ON/OFF)" "ON")"
-HWACCEL="$(input "HW decode (ON/OFF)" "ON")"
-AUTOLOGIN="no"; yesno "Appliance mode: autologin on TTY1 + auto-start Sway?" && AUTOLOGIN="yes"
-AUTO_REBOOT="yes"; yesno "Auto reboot after install?" && AUTO_REBOOT="yes" || AUTO_REBOOT="no"
+AUTOLOGIN="no"
+ui_yesno "Appliance mode: autologin on TTY1 + auto-start Sway?" && AUTOLOGIN="yes" || true
 
-echo
-echo "SUMMARY:"
-echo "Disk:     $DISK"
-echo "FS:       $FS"
-echo "Swap:     ${SWAP_G}GiB"
-echo "TZ:       $TZ"
-echo "Locale:   $LOCALE"
-echo "Keymap:   $KEYMAP"
-echo "Hostname: $HOSTNAME"
-echo "User:     $USERNAME"
-echo "Waydroid: $ATV_VARIANT"
-echo "Autosw:   $AUTOSWITCH"
-echo "HWdec:    $HWACCEL"
-echo "Autologin:$AUTOLOGIN"
-echo "Log:      $LOG_FILE"
-echo
-yesno "Proceed?" || die "Aborted"
+AUTO_REBOOT="yes"
+ui_yesno "Auto reboot after install?" && AUTO_REBOOT="yes" || AUTO_REBOOT="no"
 
-msg "Partitioning + formatting."
-_tty_read "Press Enter to continue..." ""
+_tty_echo ""
+_tty_echo "SUMMARY:"
+_tty_echo " Disk:      $DISK"
+_tty_echo " FS:        $FS"
+_tty_echo " Swap:      ${SWAP_G}GiB"
+_tty_echo " TZ:        $TZ"
+_tty_echo " Locale:    $LOCALE"
+_tty_echo " Keymap:    $KEYMAP"
+_tty_echo " Hostname:  $HOSTNAME"
+_tty_echo " User:      $USERNAME"
+_tty_echo " Waydroid:  $ATV_VARIANT"
+_tty_echo " Autosw:    $AUTOSWITCH"
+_tty_echo " HW decode: $HWACCEL"
+_tty_echo " Autologin: $AUTOLOGIN"
+_tty_echo " Log:       $LOG_FILE"
+_tty_echo ""
+ui_yesno "Proceed?" || die "Aborted"
 
-umount -R "$MNT" >/dev/null 2>&1 || true
-swapoff -a >/dev/null 2>&1 || true
+# ---- Partition / format ----
+ui_msg "Partitioning + formatting…"
 
-# safer wipe: stop if mounted
-if findmnt -rn -S "${DISK}" >/dev/null 2>&1; then
-  die "Disk $DISK still has mounted partitions. Unmount first."
-fi
+unmount_disk_everything "$DISK"
 
 sgdisk --zap-all "$DISK"
+wipefs -a "$DISK" >/dev/null 2>&1 || true
 sgdisk -o "$DISK"
 sgdisk -n 1:0:+512MiB -t 1:ef00 -c 1:"EFI" "$DISK"
 sgdisk -n 2:0:0      -t 2:8300 -c 2:"ROOT" "$DISK"
 partprobe "$DISK" || true
+udevadm settle || true
 sleep 1
 
 EFI_PART="${DISK}1"
@@ -387,8 +412,10 @@ if [[ "$FS" == "btrfs" ]]; then
   mount "$EFI_PART" "$MNT/boot"
 fi
 
-msg "Installing base system + DrapBox stack (can take a while)…"
-_tty_read "Press Enter to continue..." ""
+# =============================================================================
+# Pacstrap split: repo base only; AUR in chroot via paru
+# =============================================================================
+ui_msg "Installing base system (repo packages)…"
 
 BASE_PKGS=(
   base linux linux-firmware
@@ -407,15 +434,9 @@ BASE_PKGS=(
 )
 
 pacstrap -K "$MNT" "${BASE_PKGS[@]}"
-
-# optional repo packages (skip if missing)
-OPTIONAL_REPO_PKGS=( waydroid )
-mapfile -t OK_OPT < <(filter_existing_pkgs "${OPTIONAL_REPO_PKGS[@]}")
-((${#OK_OPT[@]})) && pacstrap -K "$MNT" "${OK_OPT[@]}"
-
 genfstab -U "$MNT" > "$MNT/etc/fstab"
 
-# swapfile
+# Swapfile
 if [[ "$SWAP_G" != "0" ]]; then
   if [[ "$FS" == "ext4" ]]; then
     fallocate -l "${SWAP_G}G" "$MNT/swapfile"
@@ -424,8 +445,8 @@ if [[ "$SWAP_G" != "0" ]]; then
     echo "/swapfile none swap defaults 0 0" >> "$MNT/etc/fstab"
   else
     mkdir -p "$MNT/swap"
-    if btrfs filesystem mkswapfile -h >/dev/null 2>&1; then
-      btrfs filesystem mkswapfile --size "${SWAP_G}G" "$MNT/swap/swapfile"
+    if arch-chroot "$MNT" bash -lc 'btrfs filesystem mkswapfile -h' >/dev/null 2>&1; then
+      arch-chroot "$MNT" bash -lc "btrfs filesystem mkswapfile --size ${SWAP_G}G /swap/swapfile"
     else
       chattr +C "$MNT/swap" || true
       fallocate -l "${SWAP_G}G" "$MNT/swap/swapfile"
@@ -436,24 +457,28 @@ if [[ "$SWAP_G" != "0" ]]; then
   fi
 fi
 
-# Persist choices
 mkdir -p "$MNT/var/lib/drapbox"
 echo "$ATV_VARIANT" > "$MNT/var/lib/drapbox/waydroid_variant"
 echo "$AUTOSWITCH"  > "$MNT/var/lib/drapbox/autoswitch"
 echo "$HWACCEL"     > "$MNT/var/lib/drapbox/hwaccel"
 
-# ---- Chroot config + AUR via paru-bin ----
+# =============================================================================
+# Chroot: system config + paru-bin + AUR packages (prefer -bin)
+# =============================================================================
 cat >"$MNT/root/drapbox-chroot.sh" <<'CHROOT'
 #!/usr/bin/env bash
 set -euo pipefail
 HOSTNAME="$1"; USERNAME="$2"; USERPASS="$3"; ROOTPASS="$4"; TZ="$5"; LOCALE="$6"; KEYMAP="$7"; AUTOLOGIN="$8"; FS="$9"
 
-# pacman.conf fixes (ILoveCandy must be global, not in repo sections)
-grep -q '^ILoveCandy' /etc/pacman.conf || sed -i '1iILoveCandy\n' /etc/pacman.conf
+echo "[chroot] configuring base system..."
+
+# pacman.conf: ILoveCandy must be GLOBAL (not in [extra]/[core])
+grep -q '^ILoveCandy$' /etc/pacman.conf || sed -i '1iILoveCandy\n' /etc/pacman.conf
 sed -i 's/^#ParallelDownloads.*/ParallelDownloads = 10/' /etc/pacman.conf || true
 
 ln -sf "/usr/share/zoneinfo/$TZ" /etc/localtime
 hwclock --systohc
+
 sed -i "s/^#\s*${LOCALE}/${LOCALE}/" /etc/locale.gen || true
 sed -i 's/^#\s*en_US.UTF-8/en_US.UTF-8/' /etc/locale.gen || true
 locale-gen
@@ -470,19 +495,19 @@ EOF
 echo "root:$ROOTPASS" | chpasswd
 useradd -m -G wheel -s /bin/bash "$USERNAME"
 echo "$USERNAME:$USERPASS" | chpasswd
-
-# sudo: allow wheel, and allow pacman NOPASSWD during install (for paru)
 sed -i 's/^# %wheel ALL=(ALL:ALL) ALL/%wheel ALL=(ALL:ALL) ALL/' /etc/sudoers
-echo '%wheel ALL=(ALL:ALL) NOPASSWD: /usr/bin/pacman, /usr/bin/pacman-key' >/etc/sudoers.d/99-drapbox-pacman
-chmod 440 /etc/sudoers.d/99-drapbox-pacman
 
 systemctl enable NetworkManager
 systemctl enable iwd
 systemctl enable bluetooth
 
-# mkinitcpio + systemd-boot
+# allow pacman without password temporarily (needed for makepkg/paru non-interactive)
+echo '%wheel ALL=(ALL:ALL) NOPASSWD: /usr/bin/pacman, /usr/bin/pacman-key' >/etc/sudoers.d/99-drapbox-pacman
+chmod 440 /etc/sudoers.d/99-drapbox-pacman
+
+# Plymouth
 if grep -q '^HOOKS=' /etc/mkinitcpio.conf; then
-  sed -i 's/^HOOKS=(\(.*\))/HOOKS=(\1 plymouth)/' /etc/mkinitcpio.conf
+  grep -q 'plymouth' /etc/mkinitcpio.conf || sed -i 's/^HOOKS=(\(.*\))/HOOKS=(\1 plymouth)/' /etc/mkinitcpio.conf
 fi
 mkdir -p /etc/plymouth
 cat >/etc/plymouth/plymouthd.conf <<EOF
@@ -492,6 +517,7 @@ ShowDelay=0
 EOF
 mkinitcpio -P
 
+# systemd-boot
 bootctl install
 ROOT_UUID="$(blkid -s UUID -o value "$(findmnt -no SOURCE /)")"
 CMDLINE="quiet splash loglevel=3 rd.systemd.show_status=auto rd.udev.log_level=3 vt.global_cursor_default=0"
@@ -517,7 +543,7 @@ initrd /initramfs-linux.img
 options root=UUID=$ROOT_UUID rw systemd.unit=multi-user.target loglevel=4
 EOF
 
-# GTK defaults
+# Environment defaults
 mkdir -p /etc/environment.d
 cat >/etc/environment.d/90-drapbox.conf <<'EOF'
 GTK_THEME=Adwaita:dark
@@ -538,38 +564,36 @@ gtk-application-prefer-dark-theme=1
 EOF
 chown "$USERNAME:$USERNAME" "$UHOME/.config/gtk-3.0/settings.ini"
 
-# -----------------------------------------------------------------------------
-# AUR: install paru-bin + AUR packages inside chroot (non-interactive)
-# -----------------------------------------------------------------------------
-echo "[aur] installing paru-bin…"
-pacman -Sy --noconfirm --needed git base-devel curl
+# =============================================================================
+# AUR via paru-bin (prefer -bin packages)
+# =============================================================================
+echo "[chroot] installing paru-bin + AUR packages..."
 
-# build as user (root should not run makepkg)
-sudo -u "$USERNAME" bash -lc '
-set -euo pipefail
-cd /tmp
-rm -rf paru-bin
-git clone https://aur.archlinux.org/paru-bin.git
-cd paru-bin
-makepkg -si --noconfirm --needed
-'
+pacman -Sy --noconfirm --needed archlinux-keyring git base-devel
+pacman-key --populate archlinux >/dev/null 2>&1 || true
 
-# AUR packages (prefer -bin)
+BUILD_DIR="/tmp/aur-build"
+rm -rf "$BUILD_DIR"
+mkdir -p "$BUILD_DIR"
+chown -R "$USERNAME:$USERNAME" "$BUILD_DIR"
+
+# build/install paru-bin as user (makepkg will sudo pacman, but NOPASSWD allows it)
+su - "$USERNAME" -c "cd '$BUILD_DIR' && rm -rf paru-bin && git clone https://aur.archlinux.org/paru-bin.git"
+su - "$USERNAME" -c "cd '$BUILD_DIR/paru-bin' && makepkg -si --noconfirm --needed"
+
+# AUR packages (use -bin)
 AUR_PKGS=(
   uxplay-bin
   gnome-network-displays
 )
 
-echo "[aur] installing AUR packages: ${AUR_PKGS[*]}"
-sudo -u "$USERNAME" bash -lc '
-set -euo pipefail
-paru -S --noconfirm --needed '"${AUR_PKGS[*]}"'
-'
+# non-interactive install
+su - "$USERNAME" -c "paru -S --noconfirm --needed --skipreview ${AUR_PKGS[*]}"
 
-# (optional) tighten sudo again after install
+# optional: tighten sudo again
 rm -f /etc/sudoers.d/99-drapbox-pacman
 
-echo "[aur] done."
+echo "[chroot] AUR install done."
 CHROOT
 
 chmod +x "$MNT/root/drapbox-chroot.sh"
@@ -583,10 +607,10 @@ echo
 
 umount -R "$MNT" >/dev/null 2>&1 || true
 
-if [[ "$AUTO_REBOOT" == "yes" ]]; then
-  msg "Install complete ✅\nRebooting now…"
+if [[ "${AUTO_REBOOT:-yes}" == "yes" ]]; then
+  ui_msg "Install complete ✅\n\nRebooting now…"
   reboot
 else
-  msg "Install complete ✅\nAuto-reboot disabled.\nDropping to shell."
+  ui_msg "Install complete ✅\n\nAuto-reboot disabled.\n\nLog: $LOG_FILE\n\nDropping to shell."
   bash
 fi
