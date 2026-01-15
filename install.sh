@@ -13,6 +13,11 @@ need(){ command -v "$1" >/dev/null 2>&1 || die "Missing: $1"; }
 
 need pacman
 need curl
+need lsblk
+need awk
+need sed
+need mount
+need umount
 
 export TERM="${TERM:-linux}"
 TTY_DEV="/dev/tty"
@@ -26,7 +31,7 @@ _tty_readline(){
 }
 
 # =============================================================================
-# Bootstrap: always run from a real file under bash (fixes /dev/fd weirdness)
+# Bootstrap: always run from a real file (fixes /dev/fd weirdness)
 # =============================================================================
 SCRIPT_URL="${SCRIPT_URL:-https://raw.githubusercontent.com/DrapNard/DrapBox/refs/heads/main/install.sh}"
 SELF="${SELF:-/run/drapbox/installer.sh}"
@@ -36,14 +41,8 @@ if (( BOOTSTRAPPED == 0 )); then
   mkdir -p /run/drapbox
   curl -fsSL "$SCRIPT_URL" -o "$SELF"
   chmod +x "$SELF"
-  exec /usr/bin/env -i \
-    BOOTSTRAPPED=1 \
-    SCRIPT_URL="$SCRIPT_URL" \
-    SELF="$SELF" \
-    LOG_FILE="${LOG_FILE:-}" \
-    TERM="${TERM:-linux}" \
-    PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
-    bash "$SELF" "$@"
+  export BOOTSTRAPPED=1
+  exec bash "$SELF" "$@"
 fi
 
 # =============================================================================
@@ -156,7 +155,7 @@ fix_system_after_overlay() {
 }
 
 # =============================================================================
-# Simple CLI UI (no whiptail dependency)
+# Simple CLI UI (TTY-safe)
 # =============================================================================
 ui_msg(){
   _tty_echo ""
@@ -184,8 +183,24 @@ ui_pass(){
 }
 
 # =============================================================================
-# Disk picker (robust)
+# Disk picker (robust) + auto-unmount + wipe safety
 # =============================================================================
+_unmount_disk_everything(){
+  local disk="$1"
+  # unmount any mounted partitions belonging to disk
+  local parts
+  mapfile -t parts < <(lsblk -lnpo NAME "$disk" 2>/dev/null | tail -n +2 || true)
+  for p in "${parts[@]}"; do
+    # unmount by mountpoint if exists
+    local mps
+    mapfile -t mps < <(lsblk -lnpo MOUNTPOINT "$p" 2>/dev/null | awk 'NF{print}')
+    for mp in "${mps[@]}"; do
+      umount -R "$mp" >/dev/null 2>&1 || true
+    done
+    swapoff "$p" >/dev/null 2>&1 || true
+  done
+}
+
 pick_disk(){
   while true; do
     _tty_echo ""
@@ -206,11 +221,6 @@ pick_disk(){
           printf "/dev/%s\t%s\t%s\n", name, size, model
         }'
     )
-
-    if ((${#disks[@]}==0)); then
-      _tty_echo "x No disks found via -P parsing, trying fallback..."
-      mapfile -t disks < <(lsblk -dn -o NAME,TYPE,SIZE | awk '$2=="disk"{printf "/dev/%s\t%s\t\n",$1,$3}')
-    fi
 
     ((${#disks[@]})) || die "No disks found."
 
@@ -235,28 +245,17 @@ pick_disk(){
 
     local d="${paths[$((choice-1))]}"
     [[ -b "$d" ]] || { _tty_echo "x Selected: $d is not a block device."; continue; }
+
+    _tty_echo ""
+    lsblk "$d" >"$TTY_DEV" || true
     ui_yesno "Confirm WIPE target: $d ?" || continue
     echo "$d"
     return 0
   done
 }
 
-unmount_disk_everything() {
-  local disk="$1"
-  # unmount anything mounted from this disk (partitions)
-  while read -r src mp _; do
-    [[ -n "$mp" ]] || continue
-    echo "• Unmounting $src from $mp"
-    umount -l "$mp" >/dev/null 2>&1 || true
-  done < <(findmnt -rn -S "${disk}*" -o SOURCE,TARGET,FSTYPE 2>/dev/null || true)
-
-  # also unmount our target mount if present
-  umount -R "$MNT" >/dev/null 2>&1 || true
-  swapoff -a >/dev/null 2>&1 || true
-}
-
 # =============================================================================
-# Network
+# Network (minimal: iwd + NetworkManager only)
 # =============================================================================
 is_online(){
   ping -c1 -W1 1.1.1.1 >/dev/null 2>&1 && return 0
@@ -312,11 +311,10 @@ ensure_network(){
 maybe_use_ramroot
 fix_system_after_overlay
 
-# Keyring baseline (idempotent)
 pacman -Sy --noconfirm --needed archlinux-keyring >/dev/null 2>&1 || true
 pacman-key --populate archlinux >/dev/null 2>&1 || true
 
-# Minimal live deps (NETWORK = iwd + networkmanager ONLY)
+# Live deps
 pacman -Sy --noconfirm --needed \
   iwd networkmanager \
   gptfdisk util-linux dosfstools e2fsprogs btrfs-progs \
@@ -328,10 +326,12 @@ ui_msg "Welcome.\n\nThis will install DrapBox.\n\nStep 1: Internet check."
 ensure_network
 
 DISK="$(pick_disk)" || die "No disk selected"
+
 HOSTNAME="$(ui_input "Hostname (also AirPlay name):" "drapbox")"
 USERNAME="$(ui_input "Admin user (sudo):" "drapnard")"
 USERPASS="$(ui_pass "Password for user '$USERNAME'")"
 ROOTPASS="$(ui_pass "Password for root")"
+
 TZ="$(ui_input "Timezone (e.g. Europe/Paris):" "Europe/Paris")"
 LOCALE="$(ui_input "Locale (e.g. en_US.UTF-8, fr_FR.UTF-8):" "en_US.UTF-8")"
 KEYMAP="$(ui_input "Keymap (e.g. us, fr, de):" "us")"
@@ -373,10 +373,15 @@ ui_yesno "Proceed?" || die "Aborted"
 # ---- Partition / format ----
 ui_msg "Partitioning + formatting…"
 
-unmount_disk_everything "$DISK"
+umount -R "$MNT" >/dev/null 2>&1 || true
+swapoff -a >/dev/null 2>&1 || true
+
+_unmount_disk_everything "$DISK"
+
+# Some archiso auto-mounts /dev/sdX1; kill it
+wipefs -af "$DISK" >/dev/null 2>&1 || true
 
 sgdisk --zap-all "$DISK"
-wipefs -a "$DISK" >/dev/null 2>&1 || true
 sgdisk -o "$DISK"
 sgdisk -n 1:0:+512MiB -t 1:ef00 -c 1:"EFI" "$DISK"
 sgdisk -n 2:0:0      -t 2:8300 -c 2:"ROOT" "$DISK"
@@ -390,6 +395,10 @@ if [[ "$DISK" =~ nvme|mmcblk ]]; then
   EFI_PART="${DISK}p1"
   ROOT_PART="${DISK}p2"
 fi
+
+# unmount partitions if still mounted
+umount -R "$EFI_PART" >/dev/null 2>&1 || true
+umount -R "$ROOT_PART" >/dev/null 2>&1 || true
 
 mkfs.fat -F32 -n EFI "$EFI_PART"
 if [[ "$FS" == "ext4" ]]; then
@@ -413,7 +422,7 @@ if [[ "$FS" == "btrfs" ]]; then
 fi
 
 # =============================================================================
-# Pacstrap split: repo base only; AUR in chroot via paru
+# Pacstrap: repo base only + base-devel (AUR build in chroot)
 # =============================================================================
 ui_msg "Installing base system (repo packages)…"
 
@@ -457,13 +466,46 @@ if [[ "$SWAP_G" != "0" ]]; then
   fi
 fi
 
+# Persist flags
 mkdir -p "$MNT/var/lib/drapbox"
 echo "$ATV_VARIANT" > "$MNT/var/lib/drapbox/waydroid_variant"
 echo "$AUTOSWITCH"  > "$MNT/var/lib/drapbox/autoswitch"
 echo "$HWACCEL"     > "$MNT/var/lib/drapbox/hwaccel"
 
 # =============================================================================
-# Chroot: system config + paru-bin + AUR packages (prefer -bin)
+# Fetch firstboot script now (so it's embedded into installed system)
+# =============================================================================
+FIRSTBOOT_URL="${FIRSTBOOT_URL:-https://raw.githubusercontent.com/DrapNard/DrapBox/refs/heads/main/firstboot.sh}"
+mkdir -p "$MNT/usr/lib/drapbox"
+curl -fsSL "$FIRSTBOOT_URL" -o "$MNT/usr/lib/drapbox/firstboot.sh"
+chmod 0755 "$MNT/usr/lib/drapbox/firstboot.sh"
+
+# Firstboot service
+cat >"$MNT/etc/systemd/system/drapbox-firstboot.service" <<'EOF'
+[Unit]
+Description=DrapBox First Boot Wizard
+After=multi-user.target NetworkManager.service bluetooth.service
+Wants=NetworkManager.service bluetooth.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/lib/drapbox/firstboot.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# Overlay menu script (calls firstboot menu)
+cat >"$MNT/usr/lib/drapbox/overlay.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+exec /usr/lib/drapbox/firstboot.sh --overlay
+EOF
+chmod 0755 "$MNT/usr/lib/drapbox/overlay.sh"
+
+# =============================================================================
+# Chroot: system config + paru-bin + AUR packages + enable firstboot
 # =============================================================================
 cat >"$MNT/root/drapbox-chroot.sh" <<'CHROOT'
 #!/usr/bin/env bash
@@ -474,20 +516,17 @@ HOSTNAME="$1"; USERNAME="$2"; USERPASS="$3"; ROOTPASS="$4"; TZ="$5"; LOCALE="$6"
 
 echo "[chroot] configuring base system..."
 
-# -----------------------------------------------------------------------------
-# pacman.conf: keep directives inside [options] (NEVER before any section)
-# -----------------------------------------------------------------------------
-# Remove a broken ILoveCandy if it was inserted at file top previously
-sed -i '1{/^ILoveCandy$/d}' /etc/pacman.conf
+# pacman.conf: keep directives inside [options]
+# remove broken global ILoveCandy if it exists at top before sections
+sed -i '1{/^ILoveCandy$/d}' /etc/pacman.conf || true
+grep -q '^\[options\]$' /etc/pacman.conf || die "pacman.conf missing [options]"
 
-grep -q '^\[options\]$' /etc/pacman.conf || die "pacman.conf missing [options] section"
-
-# Ensure ILoveCandy is under [options]
+# ILoveCandy under [options]
 grep -q '^ILoveCandy$' /etc/pacman.conf || sed -i '/^\[options\]$/a ILoveCandy' /etc/pacman.conf
 
-# ParallelDownloads = 10 under [options] (replace commented or existing)
-if grep -q '^[#[:space:]]*ParallelDownloads' /etc/pacman.conf; then
-  sed -i 's/^[#[:space:]]*ParallelDownloads.*/ParallelDownloads = 10/' /etc/pacman.conf
+# ParallelDownloads
+if grep -q '^[# ]*ParallelDownloads' /etc/pacman.conf; then
+  sed -i 's/^[# ]*ParallelDownloads.*/ParallelDownloads = 10/' /etc/pacman.conf
 else
   sed -i '/^\[options\]$/a ParallelDownloads = 10' /etc/pacman.conf
 fi
@@ -513,9 +552,10 @@ id -u "$USERNAME" >/dev/null 2>&1 || useradd -m -G wheel -s /bin/bash "$USERNAME
 echo "$USERNAME:$USERPASS" | chpasswd
 sed -i 's/^# %wheel ALL=(ALL:ALL) ALL/%wheel ALL=(ALL:ALL) ALL/' /etc/sudoers
 
-systemctl enable NetworkManager || true
-systemctl enable iwd || true
-systemctl enable bluetooth || true
+systemctl enable NetworkManager
+systemctl enable iwd
+systemctl enable bluetooth
+systemctl enable drapbox-firstboot.service
 
 # Plymouth
 if grep -q '^HOOKS=' /etc/mkinitcpio.conf; then
@@ -530,12 +570,11 @@ EOF
 mkinitcpio -P
 
 # systemd-boot
-bootctl install || true
+bootctl install
 ROOT_UUID="$(blkid -s UUID -o value "$(findmnt -no SOURCE /)")"
 CMDLINE="quiet splash loglevel=3 rd.systemd.show_status=auto rd.udev.log_level=3 vt.global_cursor_default=0"
 if [[ "$FS" == "btrfs" ]]; then CMDLINE="$CMDLINE rootflags=subvol=@"; fi
 
-mkdir -p /boot/loader/entries
 cat >/boot/loader/loader.conf <<EOF
 default drapbox.conf
 timeout 0
@@ -556,15 +595,14 @@ initrd /initramfs-linux.img
 options root=UUID=$ROOT_UUID rw systemd.unit=multi-user.target loglevel=4
 EOF
 
-# Environment defaults
+# Env defaults
 mkdir -p /etc/environment.d
 cat >/etc/environment.d/90-drapbox.conf <<'EOF'
 GTK_THEME=Adwaita:dark
 GDK_BACKEND=wayland
 EOF
 
-loginctl enable-linger "$USERNAME" >/dev/null 2>&1 || true
-
+# User config skeleton
 UHOME="$(getent passwd "$USERNAME" | cut -d: -f6)"
 install -d "$UHOME/.config/gtk-3.0" "$UHOME/.config/sway"
 chown -R "$USERNAME:$USERNAME" "$UHOME/.config"
@@ -577,13 +615,28 @@ gtk-application-prefer-dark-theme=1
 EOF
 chown "$USERNAME:$USERNAME" "$UHOME/.config/gtk-3.0/settings.ini"
 
-# -----------------------------------------------------------------------------
-# AUR via paru-bin (build as user, install as root => no sudo prompt)
-# -----------------------------------------------------------------------------
+# Basic sway binding for overlay (mod+o)
+# (you can change later)
+if [[ ! -f "$UHOME/.config/sway/config" ]]; then
+  cat >"$UHOME/.config/sway/config" <<'EOF'
+set $mod Mod4
+bindsym $mod+Return exec foot
+bindsym $mod+o exec foot -a drapbox-overlay -- bash -lc /usr/lib/drapbox/overlay.sh
+EOF
+  chown "$USERNAME:$USERNAME" "$UHOME/.config/sway/config"
+fi
+
+# =============================================================================
+# AUR via paru-bin (install non-debug package explicitly)
+# =============================================================================
 echo "[chroot] installing paru-bin + AUR packages..."
 
 pacman -Sy --noconfirm --needed archlinux-keyring git base-devel
 pacman-key --populate archlinux >/dev/null 2>&1 || true
+
+# allow pacman without password for wheel (only during build)
+echo '%wheel ALL=(ALL:ALL) NOPASSWD: /usr/bin/pacman, /usr/bin/pacman-key' >/etc/sudoers.d/99-drapbox-pacman
+chmod 440 /etc/sudoers.d/99-drapbox-pacman
 
 BUILD_DIR="/tmp/aur-build"
 rm -rf "$BUILD_DIR"
@@ -591,23 +644,28 @@ mkdir -p "$BUILD_DIR"
 chown -R "$USERNAME:$USERNAME" "$BUILD_DIR"
 
 su - "$USERNAME" -c "cd '$BUILD_DIR' && rm -rf paru-bin && git clone https://aur.archlinux.org/paru-bin.git"
+# build ONLY (no -i), then install correct pkg via pacman -U
 su - "$USERNAME" -c "cd '$BUILD_DIR/paru-bin' && makepkg -s --noconfirm --needed"
 
-# install the built package as root
-PKG="$(ls -1 "$BUILD_DIR/paru-bin"/paru-bin-*.pkg.tar.* | tail -n1)"
-[[ -n "${PKG:-}" && -f "$PKG" ]] || die "paru-bin package not built"
+PKG="$(ls -1 "$BUILD_DIR/paru-bin"/paru-bin-[0-9]*-x86_64.pkg.tar.* 2>/dev/null | tail -n1)"
+[[ -f "$PKG" ]] || die "paru-bin package not built (expected non-debug pkg)"
 pacman -U --noconfirm --needed "$PKG"
 
-# AUR packages (prefer -bin)
+command -v paru >/dev/null 2>&1 || die "paru not found after install"
+
+# Prefer -bin packages when possible
 AUR_PKGS=(
   uxplay-bin
+  # gnome-network-displays is repo on some setups, aur on others; paru handles both
   gnome-network-displays
 )
 
-# non-interactive AUR install (now paru exists, still no password prompts)
+# non interactive
 su - "$USERNAME" -c "paru -S --noconfirm --needed --skipreview ${AUR_PKGS[*]}"
 
-echo "[chroot] AUR install done."
+rm -f /etc/sudoers.d/99-drapbox-pacman
+
+echo "[chroot] done."
 CHROOT
 
 chmod +x "$MNT/root/drapbox-chroot.sh"
