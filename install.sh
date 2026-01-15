@@ -539,7 +539,7 @@ else
   chown -R "$USERNAME:$USERNAME" "$BUILD_DIR"
 
   su - "$USERNAME" -c "cd '$BUILD_DIR' && rm -rf paru && git clone https://aur.archlinux.org/paru.git"
-  su - "$USERNAME" -c "cd '$BUILD_DIR/paru' && makepkg -s --noconfirm --needed"
+  su - "$USERNAME" -c "cd '$BUILD_DIR/paru' && makepkg -si --noconfirm --needed"
   PKG="$(ls -1 "$BUILD_DIR/paru"/paru-[0-9]*-x86_64.pkg.tar.* 2>/dev/null | tail -n1)"
   [[ -f "$PKG" ]] || die "paru package not built"
   pacman -U --noconfirm --needed "$PKG"
