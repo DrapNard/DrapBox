@@ -520,14 +520,34 @@ options root=UUID=$ROOT_UUID rw $CMDLINE
 EOF
 
 # --- IMPORTANT: full sync so pacman/libalpm consistent ---
-pacman -Sy --noconfirm archlinux-keyring
+echo "[chroot] fixing pacman keyring (PGP)..."
+
+# make sure time is ok (signatures can fail if clock is wrong)
+timedatectl set-ntp true >/dev/null 2>&1 || true
+
+# hard reset keyring state (safe in fresh install)
+rm -rf /etc/pacman.d/gnupg
+pacman-key --init
+pacman-key --populate archlinux
+
+# remove possibly corrupted cached keyring packages
+rm -f /var/cache/pacman/pkg/archlinux-keyring-*.pkg.tar.* 2>/dev/null || true
+
+# resync DB and reinstall keyring
+pacman -Syy --noconfirm
+pacman -S --noconfirm --needed archlinux-keyring
+
+# if still failing, refresh keys (slow but fixes “unknown trust” cases)
+# pacman-key --refresh-keys || true
+
+# now upgrade
 pacman -Syu --noconfirm
 
-# Try install paru from repo first (best, no libalpm mismatch)
-if pacman -S --noconfirm --needed paru; then
-  echo "[chroot] paru installed from repo."
+# Try install yay from repo first (best, no libalpm mismatch)
+if pacman -S --noconfirm --needed yay; then
+  echo "[chroot] yay installed from repo."
 else
-  echo "[chroot] paru not in repo -> building from AUR (source) ..."
+  echo "[chroot] yay not in repo -> building from AUR (source) ..."
   pacman -S --noconfirm --needed git base-devel
 
   # allow pacman without password only during build
