@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-APP="DrapBox Installer v0.6.2"
+APP="DrapBox Installer v0.6.3"
 MNT=/mnt
 
 die(){ echo "✗ $*" >&2; exit 1; }
@@ -61,6 +61,105 @@ exec > >(tee -a "$LOG_FILE") 2>&1
 echo "=== DrapBox installer log: $LOG_FILE ==="
 echo "Started: $(date -Is)"
 echo
+
+# =============================================================================
+# Gum UI (fallback to plain if gum missing)
+# =============================================================================
+GUM=0
+if command -v gum >/dev/null 2>&1; then GUM=1; fi
+
+ui_clear(){
+  # gum's style looks better on clean screens
+  printf "\033c" >"$TTY_DEV" 2>/dev/null || true
+}
+
+ui_title(){
+  local t="$1"
+  if (( GUM )); then
+    ui_clear
+    gum style --border double --padding "1 2" --margin "1 2" --bold "$t" "Log: $LOG_FILE"
+  else
+    ui_clear
+    _tty_echo "== $APP == $t"
+    _tty_echo "Log: $LOG_FILE"
+  fi
+}
+
+ui_info(){
+  local msg="$1"
+  if (( GUM )); then
+    gum style --margin "0 2" --faint "$msg"
+  else
+    _tty_echo "$msg"
+  fi
+}
+
+ui_warn(){
+  local msg="$1"
+  if (( GUM )); then
+    gum style --margin "0 2" --foreground 214 --bold "⚠ $msg"
+  else
+    _tty_echo "⚠ $msg"
+  fi
+}
+
+ui_ok(){
+  local msg="$1"
+  if (( GUM )); then
+    gum style --margin "0 2" --foreground 42 --bold "✓ $msg"
+  else
+    _tty_echo "✓ $msg"
+  fi
+}
+
+ui_err(){
+  local msg="$1"
+  if (( GUM )); then
+    gum style --margin "0 2" --foreground 196 --bold "✗ $msg"
+  else
+    _tty_echo "✗ $msg"
+  fi
+}
+
+ui_yesno(){
+  local q="$1"
+  if (( GUM )); then
+    gum confirm "$q"
+  else
+    local ans
+    ans="$(_tty_readline "$q [y/N]: " "")"
+    [[ "${ans,,}" == "y" || "${ans,,}" == "yes" ]]
+  fi
+}
+
+ui_input(){
+  local prompt="$1" def="${2:-}"
+  if (( GUM )); then
+    gum input --prompt "$prompt " --value "$def"
+  else
+    _tty_readline "$prompt [$def]: " "$def"
+  fi
+}
+
+ui_pass(){
+  local prompt="$1"
+  if (( GUM )); then
+    gum input --password --prompt "$prompt "
+  else
+    ui_warn "Password input is visible in pure CLI fallback."
+    _tty_readline "$prompt: " ""
+  fi
+}
+
+ui_spin(){
+  local title="$1"; shift
+  if (( GUM )); then
+    gum spin --spinner dot --title "$title" -- "$@"
+  else
+    ui_info "$title"
+    "$@"
+  fi
+}
 
 # =============================================================================
 # RAM-root overlay (archiso cow space workaround)
@@ -134,14 +233,15 @@ maybe_use_ramroot() {
   fi
 
   if (( free_mb < threshold_mb )); then
-    echo "⚠ airootfs low (${free_mb}MB free). FORCING RAM-root overlay (${want_mb}MB)."
+    ui_warn "airootfs low (${free_mb}MB free). FORCING RAM-root overlay (${want_mb}MB)."
     enter_ramroot_overlay "$want_mb"
   fi
 }
 
 fix_system_after_overlay() {
   [[ "${IN_RAMROOT:-0}" == "1" ]] || return 0
-  echo "• [ramroot] Fixing system state after overlay…"
+  ui_info "• [ramroot] Fixing system state after overlay…"
+
   mkdir -p /var/lib/pacman /var/cache/pacman/pkg /etc/pacman.d /tmp
   chmod 1777 /tmp
   [[ -e /etc/resolv.conf ]] || echo "nameserver 1.1.1.1" > /etc/resolv.conf
@@ -157,67 +257,12 @@ fix_system_after_overlay() {
   systemctl start rngd    >/dev/null 2>&1 || true
   pacman-key --init >/dev/null 2>&1 || true
   pacman-key --populate archlinux >/dev/null 2>&1 || true
-  echo "• [ramroot] Done."
+
+  ui_ok "• [ramroot] Done."
 }
 
 # =============================================================================
-# gum UI (TTY-safe) — does NOT change logic, only wraps display/prompts
-# =============================================================================
-ensure_gum(){
-  if command -v gum >/dev/null 2>&1; then return 0; fi
-  # Install gum on the live environment (for UI)
-  pacman -Sy --noconfirm --needed gum >/dev/null 2>&1 || true
-  command -v gum >/dev/null 2>&1 || die "gum couldn't be installed (no repo / no net)."
-}
-
-ui_clear(){ clear >"$TTY_DEV" 2>/dev/null || true; }
-ui_banner(){
-  ui_clear
-  gum style --border normal --margin "1 2" --padding "1 2" \
-    --bold -- "🐾 DrapBox Installer" "Log: $LOG_FILE"
-}
-ui_note(){
-  local msg="$1"
-  gum style --margin "0 2" --padding "0 1" -- "$msg"
-}
-ui_warn(){
-  local msg="$1"
-  gum style --border normal --margin "0 2" --padding "0 1" --bold -- "⚠ $msg"
-}
-ui_fail(){
-  local msg="$1"
-  gum style --border normal --margin "0 2" --padding "0 1" --bold -- "✗ $msg"
-}
-ui_ok(){
-  local msg="$1"
-  gum style --border normal --margin "0 2" --padding "0 1" --bold -- "✓ $msg"
-}
-
-run_spin(){
-  local title="$1"; shift
-  # gum spin shows a nice spinner until the command ends
-  gum spin --spinner dot --title "$title" -- bash -lc "$*"
-}
-
-ui_input_gum(){
-  local prompt="$1" def="${2:-}"
-  gum input --prompt "$prompt " --value "$def"
-}
-ui_pass_gum(){
-  local prompt="$1"
-  gum input --password --prompt "$prompt "
-}
-ui_confirm(){
-  local prompt="$1"
-  gum confirm "$prompt"
-}
-ui_choose(){
-  local prompt="$1"; shift
-  gum choose --header "$prompt" "$@"
-}
-
-# =============================================================================
-# Disk picker (logic identical, nicer output)
+# Disk picker (same logic, nicer display)
 # =============================================================================
 _unmount_disk_everything(){
   local disk="$1"
@@ -235,10 +280,9 @@ _unmount_disk_everything(){
 
 pick_disk(){
   while true; do
-    ui_banner
-    ui_note "Select the target disk. **It will be wiped**."
+    ui_title "Disk selection"
+    ui_info "Target disk will be WIPED."
 
-    # Build list: "dev | size | model"
     mapfile -t disks < <(
       lsblk -dn -o NAME,TYPE,SIZE,MODEL -P |
       awk '
@@ -249,29 +293,47 @@ pick_disk(){
             if ($i ~ /^SIZE=/){ gsub(/SIZE=|"/,"",$i); size=$i }
             if ($i ~ /^MODEL=/){ gsub(/MODEL=|"/,"",$i); model=$i }
           }
-          printf "/dev/%s | %s | %s\n", name, size, model
+          printf "/dev/%s\t%s\t%s\n", name, size, model
         }'
     )
 
     ((${#disks[@]})) || die "No disks found."
 
-    # gum choose returns the selected string
-    local sel
-    sel="$(ui_choose "Disks:" "${disks[@]}")" || true
-    [[ -n "${sel:-}" ]] || continue
+    local menu=() paths=()
+    local i=0
+    for line in "${disks[@]}"; do
+      i=$((i+1))
+      local dev size model
+      dev="$(awk '{print $1}' <<<"$line")"
+      size="$(awk '{print $2}' <<<"$line")"
+      model="$(cut -f3- <<<"$line" | sed 's/[[:space:]]\+/ /g')"
+      paths+=("$dev")
+      menu+=("$i" "$dev  $size  $model")
+    done
 
-    local d
-    d="$(awk -F'|' '{gsub(/[[:space:]]+/,"",$1); print $1}' <<<"$sel")"
-    [[ -b "$d" ]] || { ui_warn "Selected $d is not a block device."; sleep 1; continue; }
+    local choice=""
+    if (( GUM )); then
+      choice="$(printf "%s\n" "${menu[@]}" | gum choose --no-limit --height 12 --header "Select disk number" | head -n1 | awk '{print $1}' || true)"
+    else
+      _tty_echo ""
+      for ((k=0;k<${#paths[@]};k++)); do
+        printf "%2d) %s\n" "$((k+1))" "${menu[$((k*2+1))]}" >"$TTY_DEV"
+      done
+      choice="$(_tty_readline "Select disk number [1-$i] (or 'r' refresh): " "")"
+      [[ "${choice,,}" == "r" ]] && continue
+    fi
+
+    [[ "$choice" =~ ^[0-9]+$ ]] || continue
+    (( choice>=1 && choice<=i )) || continue
+
+    local d="${paths[$((choice-1))]}"
+    [[ -b "$d" ]] || continue
 
     ui_clear
-    gum style --margin "1 2" --bold -- "Selected: $sel"
     lsblk "$d" || true
-
-    if ui_confirm "Confirm WIPE target: $d ?"; then
-      echo "$d"
-      return 0
-    fi
+    ui_yesno "Confirm WIPE target: $d ?" || continue
+    echo "$d"
+    return 0
   done
 }
 
@@ -282,124 +344,160 @@ is_online(){
   ping -c1 -W1 1.1.1.1 >/dev/null 2>&1 && return 0
   ping -c1 -W2 archlinux.org >/dev/null 2>&1
 }
+
 ensure_network(){
   timedatectl set-ntp true >/dev/null 2>&1 || true
   systemctl start iwd >/dev/null 2>&1 || true
   systemctl start NetworkManager >/dev/null 2>&1 || true
 
   while ! is_online; do
-    ui_banner
+    ui_title "Network"
     ui_warn "No internet detected."
-    local c
-    c="$(ui_choose "Choose:" "Retry" "Wi-Fi (iwctl)" "Shell" "Abort")" || true
-    case "${c:-}" in
-      "Retry") ;;
-      "Wi-Fi (iwctl)")
-        need iwctl || die "iwctl missing"
-        local wlan ssid psk
-        wlan="$(ls /sys/class/net 2>/dev/null | grep -E '^(wl|wlan)' | head -n1 || true)"
-        [[ -n "$wlan" ]] || { ui_warn "No Wi-Fi interface detected."; sleep 1; continue; }
-        ssid="$(ui_input_gum "SSID for $wlan:" "")" || true
-        [[ -n "${ssid:-}" ]] || continue
-        psk="$(ui_pass_gum "Password (empty=open):")" || true
-        iwctl device "$wlan" set-property Powered on >/dev/null 2>&1 || true
-        iwctl station "$wlan" scan >/dev/null 2>&1 || true
-        sleep 1
-        if [[ -n "${psk:-}" ]]; then
-          iwctl --passphrase "$psk" station "$wlan" connect "$ssid" >/dev/null 2>&1 || true
-        else
-          iwctl station "$wlan" connect "$ssid" >/dev/null 2>&1 || true
-        fi
-        ;;
-      "Shell")
-        ui_clear
-        ui_note "Shell opened. Type 'exit' to return."
-        bash || true
-        ;;
-      "Abort"|*) die "Aborted" ;;
-    esac
+    if (( GUM )); then
+      local act
+      act="$(printf "Retry\nWi-Fi (iwctl)\nShell\nAbort\n" | gum choose --height 8 --header "Choose action")"
+      case "$act" in
+        "Retry") ;;
+        "Wi-Fi (iwctl)")
+          need iwctl || die "iwctl missing"
+          local wlan ssid psk
+          wlan="$(ls /sys/class/net 2>/dev/null | grep -E '^(wl|wlan)' | head -n1 || true)"
+          [[ -n "$wlan" ]] || { ui_err "No Wi-Fi interface detected."; sleep 1; continue; }
+          ssid="$(ui_input "SSID for $wlan:" "")"
+          [[ -n "$ssid" ]] || continue
+          psk="$(ui_pass "Password (empty=open):")"
+          iwctl device "$wlan" set-property Powered on >/dev/null 2>&1 || true
+          iwctl station "$wlan" scan >/dev/null 2>&1 || true
+          sleep 1
+          if [[ -n "$psk" ]]; then
+            iwctl --passphrase "$psk" station "$wlan" connect "$ssid" >/dev/null 2>&1 || true
+          else
+            iwctl station "$wlan" connect "$ssid" >/dev/null 2>&1 || true
+          fi
+          ;;
+        "Shell")
+          ui_info "Shell opened. Type 'exit' to return."
+          bash || true
+          ;;
+        "Abort") die "Aborted" ;;
+      esac
+    else
+      _tty_echo " 1) Retry"
+      _tty_echo " 2) Wi-Fi (iwctl)"
+      _tty_echo " 3) Shell"
+      _tty_echo " 4) Abort"
+      local c
+      c="$(_tty_readline "Select [1-4]: " "")"
+      case "$c" in
+        1) ;;
+        2)
+          need iwctl || die "iwctl missing"
+          local wlan ssid psk
+          wlan="$(ls /sys/class/net 2>/dev/null | grep -E '^(wl|wlan)' | head -n1 || true)"
+          [[ -n "$wlan" ]] || { ui_err "No Wi-Fi interface detected."; sleep 1; continue; }
+          ssid="$(ui_input "SSID for $wlan:" "")"
+          [[ -n "$ssid" ]] || continue
+          psk="$(ui_pass "Password (empty=open):")"
+          iwctl device "$wlan" set-property Powered on >/dev/null 2>&1 || true
+          iwctl station "$wlan" scan >/dev/null 2>&1 || true
+          sleep 1
+          if [[ -n "$psk" ]]; then
+            iwctl --passphrase "$psk" station "$wlan" connect "$ssid" >/dev/null 2>&1 || true
+          else
+            iwctl station "$wlan" connect "$ssid" >/dev/null 2>&1 || true
+          fi
+          ;;
+        3) bash || true ;;
+        4) die "Aborted" ;;
+      esac
+    fi
   done
 }
 
 # =============================================================================
-# MAIN (same logic, only UI changes + gum in packages)
+# MAIN
 # =============================================================================
+ui_title "Bootstrap"
 maybe_use_ramroot
 fix_system_after_overlay
 
-# Keyring baseline (idempotent)
-pacman -Sy --noconfirm --needed archlinux-keyring >/dev/null 2>&1 || true
+# Keyring baseline
+ui_spin "Refreshing keyring (live)..." pacman -Sy --noconfirm --needed archlinux-keyring >/dev/null 2>&1 || true
 pacman-key --populate archlinux >/dev/null 2>&1 || true
 
 # Live deps (+ gum)
-run_spin "Installing live dependencies…" \
-  "pacman -Sy --noconfirm --needed \
-    iwd networkmanager gum \
-    gptfdisk util-linux dosfstools e2fsprogs btrfs-progs \
-    arch-install-scripts \
-    curl git jq \
-   >/dev/null"
+ui_spin "Installing live dependencies (incl. gum)..." pacman -Sy --noconfirm --needed \
+  iwd networkmanager \
+  gptfdisk util-linux dosfstools e2fsprogs btrfs-progs \
+  arch-install-scripts \
+  curl git jq \
+  gum \
+  >/dev/null
 
-ensure_gum
+# enable gum UI after install
+if command -v gum >/dev/null 2>&1; then GUM=1; fi
 
-ui_banner
-ui_note "This will install DrapBox on a target disk."
-ui_note "Step 1: Internet check."
-run_spin "Checking network…" "true"
+ui_title "Welcome"
+ui_info "This will install DrapBox on a selected disk."
+ui_info "Logs: $LOG_FILE"
+
 ensure_network
-ui_ok "Internet OK"
+ui_ok "Internet OK."
 
 DISK="$(pick_disk)" || die "No disk selected"
 
-HOSTNAME="$(ui_input_gum "Hostname (also AirPlay name):" "drapbox")"
-USERNAME="$(ui_input_gum "Admin user (sudo):" "drapnard")"
-USERPASS="$(ui_pass_gum "Password for user '$USERNAME':")"
-ROOTPASS="$(ui_pass_gum "Password for root:")"
+ui_title "Configuration"
+HOSTNAME="$(ui_input "Hostname (AirPlay name):" "drapbox")"
+USERNAME="$(ui_input "Admin user (sudo):" "drapnard")"
+USERPASS="$(ui_pass "Password for user '$USERNAME':")"
+ROOTPASS="$(ui_pass "Password for root:")"
 
-TZ="$(ui_input_gum "Timezone (e.g. Europe/Paris):" "Europe/Paris")"
-LOCALE="$(ui_input_gum "Locale (e.g. en_US.UTF-8, fr_FR.UTF-8):" "en_US.UTF-8")"
-KEYMAP="$(ui_input_gum "Keymap (e.g. us, fr, de):" "us")"
+TZ="$(ui_input "Timezone:" "Europe/Paris")"
+LOCALE="$(ui_input "Locale:" "en_US.UTF-8")"
+KEYMAP="$(ui_input "Keymap:" "us")"
 
-FS="$(ui_choose "Root filesystem:" "ext4" "btrfs")"
-SWAP_G="$(ui_input_gum "Swapfile size GiB (0=none):" "0")"
+FS="$(ui_input "Root FS (ext4/btrfs):" "ext4")"
+[[ "$FS" == "ext4" || "$FS" == "btrfs" ]] || die "Invalid FS: $FS"
+
+SWAP_G="$(ui_input "Swapfile size GiB (0=none):" "0")"
 [[ "$SWAP_G" =~ ^[0-9]+$ ]] || die "Invalid swap size: $SWAP_G"
 
 AUTO_REBOOT="yes"
-if ui_confirm "Auto reboot after install?"; then AUTO_REBOOT="yes"; else AUTO_REBOOT="no"; fi
+ui_yesno "Auto reboot after install?" || AUTO_REBOOT="no"
 
-ui_banner
-gum style --margin "1 2" --border normal --padding "1 2" --bold -- \
-"SUMMARY" \
-"Disk:      $DISK" \
-"FS:        $FS" \
-"Swap:      ${SWAP_G}GiB" \
-"TZ:        $TZ" \
-"Locale:    $LOCALE" \
-"Keymap:    $KEYMAP" \
-"Hostname:  $HOSTNAME" \
-"User:      $USERNAME" \
-"Log:       $LOG_FILE"
+ui_title "Summary"
+if (( GUM )); then
+  gum style --border normal --padding "1 2" --margin "1 2" \
+"Disk:      $DISK
+FS:        $FS
+Swap:      ${SWAP_G}GiB
+TZ:        $TZ
+Locale:    $LOCALE
+Keymap:    $KEYMAP
+Hostname:  $HOSTNAME
+User:      $USERNAME
+Log:       $LOG_FILE"
+else
+  _tty_echo "Disk: $DISK"
+fi
 
-ui_confirm "Proceed (WIPE + INSTALL)?" || die "Aborted"
+ui_yesno "Proceed with WIPE + install?" || die "Aborted"
 
 # ---- Partition / format ----
-ui_banner
-run_spin "Partitioning + formatting…" \
-  "umount -R '$MNT' >/dev/null 2>&1 || true; \
-   swapoff -a >/dev/null 2>&1 || true; \
-   true"
-
+ui_title "Partitioning"
+ui_spin "Unmounting..." umount -R "$MNT" >/dev/null 2>&1 || true
+swapoff -a >/dev/null 2>&1 || true
 _unmount_disk_everything "$DISK"
-wipefs -af "$DISK" >/dev/null 2>&1 || true
 
-run_spin "Creating GPT + partitions…" \
-  "sgdisk --zap-all '$DISK'; \
-   sgdisk -o '$DISK'; \
-   sgdisk -n 1:0:+512MiB -t 1:ef00 -c 1:'EFI' '$DISK'; \
-   sgdisk -n 2:0:0      -t 2:8300 -c 2:'ROOT' '$DISK'; \
-   partprobe '$DISK' || true; \
-   udevadm settle || true; \
-   sleep 1"
+ui_spin "Wiping signatures..." wipefs -af "$DISK" >/dev/null 2>&1 || true
+
+ui_spin "Creating GPT..." sgdisk --zap-all "$DISK"
+sgdisk -o "$DISK"
+sgdisk -n 1:0:+512MiB -t 1:ef00 -c 1:"EFI" "$DISK"
+sgdisk -n 2:0:0      -t 2:8300 -c 2:"ROOT" "$DISK"
+partprobe "$DISK" || true
+udevadm settle || true
+sleep 1
 
 EFI_PART="${DISK}1"
 ROOT_PART="${DISK}2"
@@ -411,33 +509,29 @@ fi
 umount -R "$EFI_PART" >/dev/null 2>&1 || true
 umount -R "$ROOT_PART" >/dev/null 2>&1 || true
 
-run_spin "Formatting EFI (FAT32)…" "mkfs.fat -F32 -n EFI '$EFI_PART'"
+ui_spin "Formatting EFI..." mkfs.fat -F32 -n EFI "$EFI_PART"
 if [[ "$FS" == "ext4" ]]; then
-  run_spin "Formatting ROOT (ext4)…" "mkfs.ext4 -F -L ROOT '$ROOT_PART'"
+  ui_spin "Formatting ROOT ext4..." mkfs.ext4 -F -L ROOT "$ROOT_PART"
 else
-  run_spin "Formatting ROOT (btrfs)…" "mkfs.btrfs -f -L ROOT '$ROOT_PART'"
+  ui_spin "Formatting ROOT btrfs..." mkfs.btrfs -f -L ROOT "$ROOT_PART"
 fi
 
-run_spin "Mounting target…" \
-  "mount '$ROOT_PART' '$MNT'; \
-   mkdir -p '$MNT/boot'; \
-   mount '$EFI_PART' '$MNT/boot'"
+ui_spin "Mounting..." mount "$ROOT_PART" "$MNT"
+mkdir -p "$MNT/boot"
+mount "$EFI_PART" "$MNT/boot"
 
 if [[ "$FS" == "btrfs" ]]; then
-  run_spin "Creating btrfs subvolumes…" \
-    "btrfs subvolume create '$MNT/@'; \
-     btrfs subvolume create '$MNT/@home'; \
-     umount '$MNT'; \
-     mount -o subvol=@ '$ROOT_PART' '$MNT'; \
-     mkdir -p '$MNT/home' '$MNT/boot'; \
-     mount -o subvol=@home '$ROOT_PART' '$MNT/home'; \
-     mount '$EFI_PART' '$MNT/boot'"
+  ui_spin "Creating btrfs subvolumes..." btrfs subvolume create "$MNT/@"
+  btrfs subvolume create "$MNT/@home"
+  umount "$MNT"
+  mount -o subvol=@ "$ROOT_PART" "$MNT"
+  mkdir -p "$MNT/home" "$MNT/boot"
+  mount -o subvol=@home "$ROOT_PART" "$MNT/home"
+  mount "$EFI_PART" "$MNT/boot"
 fi
 
 # ---- Pacstrap base ----
-ui_banner
-ui_note "Installing base system (repo packages)…"
-
+ui_title "Installing base system"
 BASE_PKGS=(
   base linux linux-firmware
   sudo git curl jq
@@ -449,39 +543,36 @@ BASE_PKGS=(
   gstreamer gst-plugins-base gst-plugins-good gst-plugins-bad gst-plugins-ugly
   base-devel
   gum
+  ttf-jetbrains-mono-nerd
+  fontconfig
 )
 
-run_spin "pacstrap (this can take a while)..." \
-  "pacstrap -K '$MNT' ${BASE_PKGS[*]}"
+ui_spin "pacstrap (repo packages)..." pacstrap -K "$MNT" "${BASE_PKGS[@]}"
+ui_spin "genfstab..." genfstab -U "$MNT" > "$MNT/etc/fstab"
 
-run_spin "Generating fstab…" "genfstab -U '$MNT' > '$MNT/etc/fstab'"
-
-# Swapfile
+# Swapfile (unchanged)
 if [[ "$SWAP_G" != "0" ]]; then
-  ui_note "Configuring swapfile (${SWAP_G}GiB)…"
   if [[ "$FS" == "ext4" ]]; then
-    run_spin "Creating swapfile…" \
-      "fallocate -l '${SWAP_G}G' '$MNT/swapfile'; \
-       chmod 600 '$MNT/swapfile'; \
-       mkswap '$MNT/swapfile'; \
-       echo '/swapfile none swap defaults 0 0' >> '$MNT/etc/fstab'"
+    ui_spin "Creating swapfile..." fallocate -l "${SWAP_G}G" "$MNT/swapfile"
+    chmod 600 "$MNT/swapfile"
+    mkswap "$MNT/swapfile"
+    echo "/swapfile none swap defaults 0 0" >> "$MNT/etc/fstab"
   else
-    run_spin "Creating swapfile…" \
-      "mkdir -p '$MNT/swap'; \
-       chattr +C '$MNT/swap' || true; \
-       fallocate -l '${SWAP_G}G' '$MNT/swap/swapfile'; \
-       chmod 600 '$MNT/swap/swapfile'; \
-       mkswap '$MNT/swap/swapfile'; \
-       echo '/swap/swapfile none swap defaults 0 0' >> '$MNT/etc/fstab'"
+    ui_spin "Creating swapfile (btrfs)..." mkdir -p "$MNT/swap"
+    chattr +C "$MNT/swap" || true
+    fallocate -l "${SWAP_G}G" "$MNT/swap/swapfile"
+    chmod 600 "$MNT/swap/swapfile"
+    mkswap "$MNT/swap/swapfile"
+    echo "/swap/swapfile none swap defaults 0 0" >> "$MNT/etc/fstab"
   fi
 fi
 
 # ---- Fetch firstboot now so it's embedded ----
+ui_title "Firstboot"
 FIRSTBOOT_URL="${FIRSTBOOT_URL:-https://raw.githubusercontent.com/DrapNard/DrapBox/refs/heads/main/firstboot.sh}"
 mkdir -p "$MNT/usr/lib/drapbox"
-run_spin "Fetching firstboot.sh…" \
-  "curl -fsSL '$FIRSTBOOT_URL' -o '$MNT/usr/lib/drapbox/firstboot.sh'; \
-   chmod 0755 '$MNT/usr/lib/drapbox/firstboot.sh'"
+ui_spin "Downloading firstboot.sh..." curl -fsSL "$FIRSTBOOT_URL" -o "$MNT/usr/lib/drapbox/firstboot.sh"
+chmod 0755 "$MNT/usr/lib/drapbox/firstboot.sh"
 
 cat >"$MNT/etc/systemd/system/drapbox-firstboot.service" <<'EOF'
 [Unit]
@@ -493,12 +584,18 @@ Wants=NetworkManager.service bluetooth.service
 Type=oneshot
 ExecStart=/usr/lib/drapbox/firstboot.sh --firstboot
 RemainAfterExit=yes
+StandardInput=tty
+TTYPath=/dev/tty1
+TTYReset=yes
+TTYVHangup=yes
+TTYVTDisallocate=yes
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-# ---- Chroot config (unchanged logic) ----
+# ---- Chroot config (logic unchanged) ----
+ui_title "Chroot configuration"
 cat >"$MNT/root/drapbox-chroot.sh" <<'CHROOT'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -554,18 +651,67 @@ initrd /initramfs-linux.img
 options root=UUID=$ROOT_UUID rw $CMDLINE
 EOF
 
+# --- PGP / keyring recovery (unchanged) ---
 echo "[chroot] fixing pacman keyring (PGP)..."
 timedatectl set-ntp true >/dev/null 2>&1 || true
-
 rm -rf /etc/pacman.d/gnupg
 pacman-key --init
 pacman-key --populate archlinux
-
 rm -f /var/cache/pacman/pkg/archlinux-keyring-*.pkg.tar.* 2>/dev/null || true
 pacman -Syy --noconfirm
 pacman -S --noconfirm --needed archlinux-keyring
 pacman -Syu --noconfirm
 
+# --- Font defaults: JetBrainsMono Nerd Font ---
+# fontconfig default monospace + sans/serif
+mkdir -p /etc/fonts/conf.d
+cat >/etc/fonts/local.conf <<'EOF'
+<?xml version="1.0"?>
+<!DOCTYPE fontconfig SYSTEM "fonts.dtd">
+<fontconfig>
+  <alias>
+    <family>monospace</family>
+    <prefer>
+      <family>JetBrainsMono Nerd Font</family>
+      <family>JetBrains Mono</family>
+    </prefer>
+  </alias>
+  <alias>
+    <family>sans-serif</family>
+    <prefer>
+      <family>JetBrainsMono Nerd Font</family>
+      <family>JetBrains Mono</family>
+      <family>DejaVu Sans</family>
+    </prefer>
+  </alias>
+  <alias>
+    <family>serif</family>
+    <prefer>
+      <family>JetBrainsMono Nerd Font</family>
+      <family>JetBrains Mono</family>
+      <family>DejaVu Serif</family>
+    </prefer>
+  </alias>
+</fontconfig>
+EOF
+
+# foot default font
+mkdir -p /etc/xdg/foot
+if [[ ! -f /etc/xdg/foot/foot.ini ]]; then
+  cat >/etc/xdg/foot/foot.ini <<'EOF'
+[main]
+font=JetBrainsMono Nerd Font:size=12
+EOF
+else
+  # best-effort patch existing config
+  if grep -q '^[[:space:]]*font=' /etc/xdg/foot/foot.ini; then
+    sed -i 's|^[[:space:]]*font=.*|font=JetBrainsMono Nerd Font:size=12|' /etc/xdg/foot/foot.ini
+  else
+    printf "\n[main]\nfont=JetBrainsMono Nerd Font:size=12\n" >> /etc/xdg/foot/foot.ini
+  fi
+fi
+
+# Try install yay from repo first
 if pacman -S --noconfirm --needed yay; then
   echo "[chroot] yay installed from repo."
 else
@@ -600,23 +746,20 @@ echo "[chroot] done."
 CHROOT
 
 chmod +x "$MNT/root/drapbox-chroot.sh"
-ui_banner
-run_spin "Configuring installed system (chroot)..." \
-  "arch-chroot '$MNT' /root/drapbox-chroot.sh '$HOSTNAME' '$USERNAME' '$USERPASS' '$ROOTPASS' '$TZ' '$LOCALE' '$KEYMAP' '$FS'"
+ui_spin "Running arch-chroot config..." arch-chroot "$MNT" /root/drapbox-chroot.sh \
+  "$HOSTNAME" "$USERNAME" "$USERPASS" "$ROOTPASS" "$TZ" "$LOCALE" "$KEYMAP" "$FS"
 
-ui_banner
+ui_title "Finish"
 ui_ok "Install complete."
-ui_note "Log file: $LOG_FILE"
-ui_note "After reboot, **firstboot** will start automatically (network / bluetooth helpers)."
+ui_info "Log file: $LOG_FILE"
 
 umount -R "$MNT" >/dev/null 2>&1 || true
 
 if [[ "${AUTO_REBOOT:-yes}" == "yes" ]]; then
-  ui_note "Rebooting now…"
-  sleep 2
+  ui_ok "Rebooting now..."
   reboot
 else
   ui_warn "Auto-reboot disabled."
-  ui_note "You can reboot manually. Log: $LOG_FILE"
+  ui_info "You can reboot manually. Log: $LOG_FILE"
   bash
 fi
