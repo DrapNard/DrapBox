@@ -561,7 +561,6 @@ else
   su - "$USERNAME" -c "cd '$BUILD_DIR' && rm -rf yay-bin && git clone https://aur.archlinux.org/yay-bin.git"
   su - "$USERNAME" -c "cd '$BUILD_DIR/yay-bin' && makepkg -si --noconfirm --needed"
   
-  rm -f /etc/sudoers.d/99-drapbox-pacman
 fi
 
 command -v yay >/dev/null 2>&1 || die "yay missing"
@@ -576,6 +575,8 @@ for p in "${want_repo[@]}"; do
     su - "$USERNAME" -c "yay -S --noconfirm --needed $p"
   fi
 done
+
+rm -f /etc/sudoers.d/99-drapbox-pacman
 
 echo "[chroot] done."
 CHROOT
