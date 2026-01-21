@@ -63,24 +63,16 @@ echo "Started: $(date -Is)"
 echo
 
 # =============================================================================
-# Gum UI (TTY-safe even with tee logging)
+# Gum UI (fallback to plain if gum missing)
 # =============================================================================
 GUM=0
 if command -v gum >/dev/null 2>&1; then GUM=1; fi
 
-# IMPORTANT: tee breaks TTY detection (stdout is not a TTY anymore),
-# so we force gum to use the real TTY for stdin/stdout/stderr.
-gum_tty(){ command gum "$@" </dev/tty >/dev/tty 2>/dev/tty; }
-
-# nicer defaults (optional but helps match examples)
-export GUM_SPIN_SPINNER="${GUM_SPIN_SPINNER:-dot}"
-export GUM_SPIN_SHOW_OUTPUT="${GUM_SPIN_SHOW_OUTPUT:-false}"
-export GUM_CHOOSE_CURSOR="${GUM_CHOOSE_CURSOR:-▶ }"
-export GUM_CHOOSE_SELECTED_PREFIX="${GUM_CHOOSE_SELECTED_PREFIX:-✓ }"
-export GUM_CHOOSE_UNSELECTED_PREFIX="${GUM_CHOOSE_UNSELECTED_PREFIX:-  }"
+# Run gum fully attached to the real TTY (fixes weird stdin/pipe issues)
+gum_tty(){ command gum "$@" </dev/tty >/dev/tty; }
 
 ui_clear(){
-  # full reset > clear (matches gum examples better)
+  # gum's style looks better on clean screens
   printf "\033c" >"$TTY_DEV" 2>/dev/null || true
 }
 
@@ -88,14 +80,11 @@ ui_title(){
   local t="$1"
   if (( GUM )); then
     ui_clear
-    gum_tty style --border double --padding "1 2" --margin "1 2" --bold "$APP" "$t"
-    gum_tty style --margin "0 2" --faint "Log: $LOG_FILE"
-    echo
+    gum_tty style --border double --padding "1 2" --margin "1 2" --bold "$APP" "$t" "Log: $LOG_FILE"
   else
     ui_clear
     _tty_echo "== $APP == $t"
     _tty_echo "Log: $LOG_FILE"
-    _tty_echo ""
   fi
 }
 
@@ -168,7 +157,7 @@ ui_pass(){
 ui_spin(){
   local title="$1"; shift
   if (( GUM )); then
-    gum_tty spin --spinner "${GUM_SPIN_SPINNER:-dot}" --title "$title" -- "$@"
+    gum_tty spin --spinner dot --title "$title" -- "$@"
   else
     ui_info "$title"
     "$@"
@@ -276,7 +265,7 @@ fix_system_after_overlay() {
 }
 
 # =============================================================================
-# Disk picker (same logic, gum-usable, single-select)
+# Disk picker (same logic, fixed gum choose feeding)
 # =============================================================================
 _unmount_disk_everything(){
   local disk="$1"
@@ -307,7 +296,7 @@ pick_disk(){
             if ($i ~ /^SIZE=/){ gsub(/SIZE=|"/,"",$i); size=$i }
             if ($i ~ /^MODEL=/){ gsub(/MODEL=|"/,"",$i); model=$i }
           }
-          printf "/dev/%s\t%s\t%s\n", name, size, model
+          printf "/dev/%s  %s  %s\n", name, size, model
         }'
     )
 
@@ -315,10 +304,8 @@ pick_disk(){
 
     local chosen_line=""
     if (( GUM )); then
-      chosen_line="$(
-        printf "%s\n" "${disks[@]}" |
-          gum_tty choose --height 12 --header "Select target disk"
-      )" || true
+      # IMPORTANT: pass options as args, NOT via pipe (gum stdin is /dev/tty here)
+      chosen_line="$(gum_tty choose --height 12 --header "Select target disk" "${disks[@]}")" || true
     else
       _tty_echo ""
       local i=0
@@ -328,13 +315,14 @@ pick_disk(){
       done
       local choice
       choice="$(_tty_readline "Select disk number [1-$i] (or 'r' refresh): " "")"
+      [[ -z "$choice" ]] && continue
       [[ "${choice,,}" == "r" ]] && continue
       [[ "$choice" =~ ^[0-9]+$ ]] || continue
       (( choice>=1 && choice<=i )) || continue
       chosen_line="${disks[$((choice-1))]}"
     fi
 
-    [[ -n "${chosen_line:-}" ]] || continue
+    [[ -n "$chosen_line" ]] || continue
 
     local d
     d="$(awk '{print $1}' <<<"$chosen_line")"
@@ -349,7 +337,7 @@ pick_disk(){
 }
 
 # =============================================================================
-# Network (logic unchanged)
+# Network (logic unchanged, fixed gum choose feeding)
 # =============================================================================
 is_online(){
   ping -c1 -W1 1.1.1.1 >/dev/null 2>&1 && return 0
@@ -364,10 +352,17 @@ ensure_network(){
   while ! is_online; do
     ui_title "Network"
     ui_warn "No internet detected."
+
     if (( GUM )); then
       local act
-      act="$(printf "Retry\nWi-Fi (iwctl)\nShell\nAbort\n" | gum_tty choose --height 8 --header "Choose action")" || true
-      case "${act:-}" in
+      act="$(gum_tty choose --height 8 --header "Choose action" \
+        "Retry" \
+        "Wi-Fi (iwctl)" \
+        "Shell" \
+        "Abort"
+      )" || true
+
+      case "$act" in
         "Retry") ;;
         "Wi-Fi (iwctl)")
           need iwctl || die "iwctl missing"
