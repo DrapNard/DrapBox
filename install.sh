@@ -47,17 +47,32 @@ _ui_title(){
   _tty_echo "  Log: $LOG_FILE"
   _ui_line
 }
-_ui_step(){
-  # usage: _ui_step "1/7" "Text..."
-  local n="$1" msg="$2"
-  _tty_echo ""
-  _tty_echo "[$n] $msg"
-}
+_ui_step(){ local n="$1" msg="$2"; _tty_echo ""; _tty_echo "[$n] $msg"; }
 _ui_ok(){ _tty_echo "  ✓ $*"; }
 _ui_warn(){ _tty_echo "  ⚠ $*"; }
-_ui_fail(){ _tty_echo "  ✗ $*"; }
 _ui_kv(){ printf "  %-12s %s\n" "$1" "$2" >"$TTY_DEV"; }
-_ui_pause(){ _tty_readline "Press Enter to continue..." "" >/dev/null; }
+
+# Non-blocking message (no "Press Enter")
+ui_msg(){
+  _ui_title
+  _tty_echo "$1"
+  _tty_echo ""
+}
+
+ui_yesno(){
+  local ans
+  ans="$(_tty_readline "$1 [y/N]: " "")"
+  [[ "${ans,,}" == "y" || "${ans,,}" == "yes" ]]
+}
+ui_input(){
+  local msg="$1" def="${2:-}"
+  _tty_readline "$msg [$def]: " "$def"
+}
+ui_pass(){
+  local msg="$1"
+  _tty_echo "(!) Password input is visible in pure CLI mode."
+  _tty_readline "$msg: " ""
+}
 
 # =============================================================================
 # Bootstrap: always run from a real file (fixes /dev/fd weirdness)
@@ -181,30 +196,6 @@ fix_system_after_overlay() {
   pacman-key --init >/dev/null 2>&1 || true
   pacman-key --populate archlinux >/dev/null 2>&1 || true
   echo "• [ramroot] Done."
-}
-
-# =============================================================================
-# Simple CLI UI (TTY-safe)
-# =============================================================================
-ui_msg(){
-  _ui_title
-  _tty_echo "$1"
-  _tty_echo ""
-  _ui_pause
-}
-ui_yesno(){
-  local ans
-  ans="$(_tty_readline "$1 [y/N]: " "")"
-  [[ "${ans,,}" == "y" || "${ans,,}" == "yes" ]]
-}
-ui_input(){
-  local msg="$1" def="${2:-}"
-  _tty_readline "$msg [$def]: " "$def"
-}
-ui_pass(){
-  local msg="$1"
-  _tty_echo "(!) Password input is visible in pure CLI mode."
-  _tty_readline "$msg: " ""
 }
 
 # =============================================================================
@@ -337,7 +328,6 @@ _ui_title
 _ui_step "0/7" "Preparing installer environment"
 pacman -Sy --noconfirm --needed archlinux-keyring >/dev/null 2>&1 || true
 pacman-key --populate archlinux >/dev/null 2>&1 || true
-_ui_ok "Keyring baseline done"
 
 # Live deps
 pacman -Sy --noconfirm --needed \
@@ -346,7 +336,7 @@ pacman -Sy --noconfirm --needed \
   arch-install-scripts \
   curl git jq \
   >/dev/null
-_ui_ok "Live dependencies installed"
+_ui_ok "Live deps ready"
 
 ui_msg "Welcome.\n\nThis will install DrapBox.\n\nStep 1: Internet check."
 ensure_network
@@ -433,7 +423,7 @@ if [[ "$FS" == "btrfs" ]]; then
   mount -o subvol=@home "$ROOT_PART" "$MNT/home"
   mount "$EFI_PART" "$MNT/boot"
 fi
-_ui_ok "Disk prepared"
+_ui_ok "Disk ready"
 
 # ---- Pacstrap base ----
 _ui_title
@@ -452,7 +442,7 @@ BASE_PKGS=(
 
 pacstrap -K "$MNT" "${BASE_PKGS[@]}"
 genfstab -U "$MNT" > "$MNT/etc/fstab"
-_ui_ok "Base installed + fstab generated"
+_ui_ok "Base installed"
 
 # Swapfile
 if [[ "$SWAP_G" != "0" ]]; then
@@ -470,7 +460,7 @@ if [[ "$SWAP_G" != "0" ]]; then
     mkswap "$MNT/swap/swapfile"
     echo "/swap/swapfile none swap defaults 0 0" >> "$MNT/etc/fstab"
   fi
-  _ui_ok "Swapfile ready"
+  _ui_ok "Swap ready"
 fi
 
 # ---- Fetch firstboot now so it's embedded ----
@@ -496,9 +486,9 @@ RemainAfterExit=yes
 [Install]
 WantedBy=multi-user.target
 EOF
-_ui_ok "firstboot systemd unit written"
+_ui_ok "firstboot unit created"
 
-# ---- Chroot config (incl. repo paru, fallback aur paru) ----
+# ---- Chroot config ----
 _ui_title
 _ui_step "6/7" "Configuring installed system (chroot)"
 cat >"$MNT/root/drapbox-chroot.sh" <<'CHROOT'
@@ -608,7 +598,7 @@ CHROOT
 chmod +x "$MNT/root/drapbox-chroot.sh"
 arch-chroot "$MNT" /root/drapbox-chroot.sh \
   "$HOSTNAME" "$USERNAME" "$USERPASS" "$ROOTPASS" "$TZ" "$LOCALE" "$KEYMAP" "$FS"
-_ui_ok "Chroot configuration complete"
+_ui_ok "Chroot done"
 
 echo
 echo "✅ Install complete."
@@ -618,8 +608,7 @@ echo
 umount -R "$MNT" >/dev/null 2>&1 || true
 
 # =============================================================================
-# Post-install UX (CLI only) - DOES NOT CHANGE LOGIC
-# Adds a clear “firstboot will run after reboot” notice
+# Finish (no waiting / no extra user input)
 # =============================================================================
 _ui_title
 _ui_step "7/7" "Finish"
@@ -628,18 +617,15 @@ _tty_echo "Next boot:"
 _tty_echo "  • DrapBox will start normally"
 _tty_echo "  • firstboot will auto-run once via: drapbox-firstboot.service"
 _tty_echo ""
-_tty_echo "Tip: If firstboot doesn't show, check:"
+_tty_echo "If firstboot doesn't show:"
 _tty_echo "  systemctl status drapbox-firstboot.service"
 _tty_echo ""
+_ui_line
 
 if [[ "${AUTO_REBOOT:-yes}" == "yes" ]]; then
   _tty_echo "Rebooting now…"
-  _ui_line
   reboot
 else
-  _tty_echo "Auto-reboot disabled."
-  _tty_echo "Log: $LOG_FILE"
-  _tty_echo "Dropping to shell."
-  _ui_line
+  _tty_echo "Auto-reboot disabled. Dropping to shell."
   bash
 fi
