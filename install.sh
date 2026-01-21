@@ -63,13 +63,24 @@ echo "Started: $(date -Is)"
 echo
 
 # =============================================================================
-# Gum UI (fallback to plain if gum missing)
+# Gum UI (TTY-safe even with tee logging)
 # =============================================================================
 GUM=0
 if command -v gum >/dev/null 2>&1; then GUM=1; fi
 
+# IMPORTANT: tee breaks TTY detection (stdout is not a TTY anymore),
+# so we force gum to use the real TTY for stdin/stdout/stderr.
+gum_tty(){ command gum "$@" </dev/tty >/dev/tty 2>/dev/tty; }
+
+# nicer defaults (optional but helps match examples)
+export GUM_SPIN_SPINNER="${GUM_SPIN_SPINNER:-dot}"
+export GUM_SPIN_SHOW_OUTPUT="${GUM_SPIN_SHOW_OUTPUT:-false}"
+export GUM_CHOOSE_CURSOR="${GUM_CHOOSE_CURSOR:-▶ }"
+export GUM_CHOOSE_SELECTED_PREFIX="${GUM_CHOOSE_SELECTED_PREFIX:-✓ }"
+export GUM_CHOOSE_UNSELECTED_PREFIX="${GUM_CHOOSE_UNSELECTED_PREFIX:-  }"
+
 ui_clear(){
-  # gum's style looks better on clean screens
+  # full reset > clear (matches gum examples better)
   printf "\033c" >"$TTY_DEV" 2>/dev/null || true
 }
 
@@ -77,18 +88,21 @@ ui_title(){
   local t="$1"
   if (( GUM )); then
     ui_clear
-    gum style --border double --padding "1 2" --margin "1 2" --bold "$t" "Log: $LOG_FILE"
+    gum_tty style --border double --padding "1 2" --margin "1 2" --bold "$APP" "$t"
+    gum_tty style --margin "0 2" --faint "Log: $LOG_FILE"
+    echo
   else
     ui_clear
     _tty_echo "== $APP == $t"
     _tty_echo "Log: $LOG_FILE"
+    _tty_echo ""
   fi
 }
 
 ui_info(){
   local msg="$1"
   if (( GUM )); then
-    gum style --margin "0 2" --faint "$msg"
+    gum_tty style --margin "0 2" --faint "$msg"
   else
     _tty_echo "$msg"
   fi
@@ -97,7 +111,7 @@ ui_info(){
 ui_warn(){
   local msg="$1"
   if (( GUM )); then
-    gum style --margin "0 2" --foreground 214 --bold "⚠ $msg"
+    gum_tty style --margin "0 2" --foreground 214 --bold "⚠ $msg"
   else
     _tty_echo "⚠ $msg"
   fi
@@ -106,7 +120,7 @@ ui_warn(){
 ui_ok(){
   local msg="$1"
   if (( GUM )); then
-    gum style --margin "0 2" --foreground 42 --bold "✓ $msg"
+    gum_tty style --margin "0 2" --foreground 42 --bold "✓ $msg"
   else
     _tty_echo "✓ $msg"
   fi
@@ -115,7 +129,7 @@ ui_ok(){
 ui_err(){
   local msg="$1"
   if (( GUM )); then
-    gum style --margin "0 2" --foreground 196 --bold "✗ $msg"
+    gum_tty style --margin "0 2" --foreground 196 --bold "✗ $msg"
   else
     _tty_echo "✗ $msg"
   fi
@@ -124,7 +138,7 @@ ui_err(){
 ui_yesno(){
   local q="$1"
   if (( GUM )); then
-    gum confirm "$q"
+    gum_tty confirm "$q"
   else
     local ans
     ans="$(_tty_readline "$q [y/N]: " "")"
@@ -135,7 +149,7 @@ ui_yesno(){
 ui_input(){
   local prompt="$1" def="${2:-}"
   if (( GUM )); then
-    gum input --prompt "$prompt " --value "$def"
+    gum_tty input --prompt "$prompt " --value "$def"
   else
     _tty_readline "$prompt [$def]: " "$def"
   fi
@@ -144,7 +158,7 @@ ui_input(){
 ui_pass(){
   local prompt="$1"
   if (( GUM )); then
-    gum input --password --prompt "$prompt "
+    gum_tty input --password --prompt "$prompt "
   else
     ui_warn "Password input is visible in pure CLI fallback."
     _tty_readline "$prompt: " ""
@@ -154,7 +168,7 @@ ui_pass(){
 ui_spin(){
   local title="$1"; shift
   if (( GUM )); then
-    gum spin --spinner dot --title "$title" -- "$@"
+    gum_tty spin --spinner "${GUM_SPIN_SPINNER:-dot}" --title "$title" -- "$@"
   else
     ui_info "$title"
     "$@"
@@ -262,7 +276,7 @@ fix_system_after_overlay() {
 }
 
 # =============================================================================
-# Disk picker (same logic, nicer display)
+# Disk picker (same logic, gum-usable, single-select)
 # =============================================================================
 _unmount_disk_everything(){
   local disk="$1"
@@ -299,34 +313,31 @@ pick_disk(){
 
     ((${#disks[@]})) || die "No disks found."
 
-    local menu=() paths=()
-    local i=0
-    for line in "${disks[@]}"; do
-      i=$((i+1))
-      local dev size model
-      dev="$(awk '{print $1}' <<<"$line")"
-      size="$(awk '{print $2}' <<<"$line")"
-      model="$(cut -f3- <<<"$line" | sed 's/[[:space:]]\+/ /g')"
-      paths+=("$dev")
-      menu+=("$i" "$dev  $size  $model")
-    done
-
-    local choice=""
+    local chosen_line=""
     if (( GUM )); then
-      choice="$(printf "%s\n" "${menu[@]}" | gum choose --no-limit --height 12 --header "Select disk number" | head -n1 | awk '{print $1}' || true)"
+      chosen_line="$(
+        printf "%s\n" "${disks[@]}" |
+          gum_tty choose --height 12 --header "Select target disk"
+      )" || true
     else
       _tty_echo ""
-      for ((k=0;k<${#paths[@]};k++)); do
-        printf "%2d) %s\n" "$((k+1))" "${menu[$((k*2+1))]}" >"$TTY_DEV"
+      local i=0
+      for line in "${disks[@]}"; do
+        i=$((i+1))
+        printf "%2d) %s\n" "$i" "$line" >"$TTY_DEV"
       done
+      local choice
       choice="$(_tty_readline "Select disk number [1-$i] (or 'r' refresh): " "")"
       [[ "${choice,,}" == "r" ]] && continue
+      [[ "$choice" =~ ^[0-9]+$ ]] || continue
+      (( choice>=1 && choice<=i )) || continue
+      chosen_line="${disks[$((choice-1))]}"
     fi
 
-    [[ "$choice" =~ ^[0-9]+$ ]] || continue
-    (( choice>=1 && choice<=i )) || continue
+    [[ -n "${chosen_line:-}" ]] || continue
 
-    local d="${paths[$((choice-1))]}"
+    local d
+    d="$(awk '{print $1}' <<<"$chosen_line")"
     [[ -b "$d" ]] || continue
 
     ui_clear
@@ -355,8 +366,8 @@ ensure_network(){
     ui_warn "No internet detected."
     if (( GUM )); then
       local act
-      act="$(printf "Retry\nWi-Fi (iwctl)\nShell\nAbort\n" | gum choose --height 8 --header "Choose action")"
-      case "$act" in
+      act="$(printf "Retry\nWi-Fi (iwctl)\nShell\nAbort\n" | gum_tty choose --height 8 --header "Choose action")" || true
+      case "${act:-}" in
         "Retry") ;;
         "Wi-Fi (iwctl)")
           need iwctl || die "iwctl missing"
@@ -380,6 +391,7 @@ ensure_network(){
           bash || true
           ;;
         "Abort") die "Aborted" ;;
+        *) ;;
       esac
     else
       _tty_echo " 1) Retry"
@@ -409,6 +421,7 @@ ensure_network(){
           ;;
         3) bash || true ;;
         4) die "Aborted" ;;
+        *) ;;
       esac
     fi
   done
@@ -467,7 +480,7 @@ ui_yesno "Auto reboot after install?" || AUTO_REBOOT="no"
 
 ui_title "Summary"
 if (( GUM )); then
-  gum style --border normal --padding "1 2" --margin "1 2" \
+  gum_tty style --border normal --padding "1 2" --margin "1 2" \
 "Disk:      $DISK
 FS:        $FS
 Swap:      ${SWAP_G}GiB
@@ -663,7 +676,6 @@ pacman -S --noconfirm --needed archlinux-keyring
 pacman -Syu --noconfirm
 
 # --- Font defaults: JetBrainsMono Nerd Font ---
-# fontconfig default monospace + sans/serif
 mkdir -p /etc/fonts/conf.d
 cat >/etc/fonts/local.conf <<'EOF'
 <?xml version="1.0"?>
@@ -695,7 +707,6 @@ cat >/etc/fonts/local.conf <<'EOF'
 </fontconfig>
 EOF
 
-# foot default font
 mkdir -p /etc/xdg/foot
 if [[ ! -f /etc/xdg/foot/foot.ini ]]; then
   cat >/etc/xdg/foot/foot.ini <<'EOF'
@@ -703,7 +714,6 @@ if [[ ! -f /etc/xdg/foot/foot.ini ]]; then
 font=JetBrainsMono Nerd Font:size=12
 EOF
 else
-  # best-effort patch existing config
   if grep -q '^[[:space:]]*font=' /etc/xdg/foot/foot.ini; then
     sed -i 's|^[[:space:]]*font=.*|font=JetBrainsMono Nerd Font:size=12|' /etc/xdg/foot/foot.ini
   else
