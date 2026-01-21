@@ -37,6 +37,29 @@ _tty_readline(){
 }
 
 # =============================================================================
+# UI sugar (TTY only) - DOES NOT CHANGE LOGIC
+# =============================================================================
+_ui_line(){ _tty_echo "────────────────────────────────────────────────────────────"; }
+_ui_title(){
+  _tty_echo ""
+  _ui_line
+  _tty_echo "  $APP"
+  _tty_echo "  Log: $LOG_FILE"
+  _ui_line
+}
+_ui_step(){
+  # usage: _ui_step "1/7" "Text..."
+  local n="$1" msg="$2"
+  _tty_echo ""
+  _tty_echo "[$n] $msg"
+}
+_ui_ok(){ _tty_echo "  ✓ $*"; }
+_ui_warn(){ _tty_echo "  ⚠ $*"; }
+_ui_fail(){ _tty_echo "  ✗ $*"; }
+_ui_kv(){ printf "  %-12s %s\n" "$1" "$2" >"$TTY_DEV"; }
+_ui_pause(){ _tty_readline "Press Enter to continue..." "" >/dev/null; }
+
+# =============================================================================
 # Bootstrap: always run from a real file (fixes /dev/fd weirdness)
 # =============================================================================
 SCRIPT_URL="${SCRIPT_URL:-https://raw.githubusercontent.com/DrapNard/DrapBox/refs/heads/main/install.sh}"
@@ -134,7 +157,7 @@ maybe_use_ramroot() {
   fi
 
   if (( free_mb < threshold_mb )); then
-    echo "⚠ airootfs low (${free_mb}MB free). FORCING RAM-root overlay (${want_mb}MB)."
+    _ui_warn "airootfs low (${free_mb}MB free). Forcing RAM-root overlay (${want_mb}MB)."
     enter_ramroot_overlay "$want_mb"
   fi
 }
@@ -164,11 +187,10 @@ fix_system_after_overlay() {
 # Simple CLI UI (TTY-safe)
 # =============================================================================
 ui_msg(){
-  _tty_echo ""
-  _tty_echo "== $APP =="
+  _ui_title
   _tty_echo "$1"
-  _tty_echo "Log: $LOG_FILE"
-  _tty_readline "Press Enter to continue..." "" >/dev/null
+  _tty_echo ""
+  _ui_pause
 }
 ui_yesno(){
   local ans
@@ -204,7 +226,7 @@ _unmount_disk_everything(){
 
 pick_disk(){
   while true; do
-    _tty_echo ""
+    _ui_title
     _tty_echo "=== Disks detected (target will be WIPED) ==="
     _tty_echo "NAME        SIZE   MODEL"
     _tty_echo "-------------------------------------------"
@@ -268,7 +290,7 @@ ensure_network(){
   systemctl start NetworkManager >/dev/null 2>&1 || true
 
   while ! is_online; do
-    _tty_echo ""
+    _ui_title
     _tty_echo "No internet detected."
     _tty_echo " 1) Retry"
     _tty_echo " 2) Wi-Fi (iwctl)"
@@ -311,8 +333,11 @@ ensure_network(){
 maybe_use_ramroot
 fix_system_after_overlay
 
+_ui_title
+_ui_step "0/7" "Preparing installer environment"
 pacman -Sy --noconfirm --needed archlinux-keyring >/dev/null 2>&1 || true
 pacman-key --populate archlinux >/dev/null 2>&1 || true
+_ui_ok "Keyring baseline done"
 
 # Live deps
 pacman -Sy --noconfirm --needed \
@@ -321,9 +346,11 @@ pacman -Sy --noconfirm --needed \
   arch-install-scripts \
   curl git jq \
   >/dev/null
+_ui_ok "Live dependencies installed"
 
 ui_msg "Welcome.\n\nThis will install DrapBox.\n\nStep 1: Internet check."
 ensure_network
+_ui_ok "Internet OK"
 
 DISK="$(pick_disk)" || die "No disk selected"
 
@@ -345,23 +372,23 @@ SWAP_G="$(ui_input "Swapfile size GiB (0=none):" "0")"
 AUTO_REBOOT="yes"
 ui_yesno "Auto reboot after install?" && AUTO_REBOOT="yes" || AUTO_REBOOT="no"
 
-_tty_echo ""
+_ui_title
 _tty_echo "SUMMARY:"
-_tty_echo " Disk:      $DISK"
-_tty_echo " FS:        $FS"
-_tty_echo " Swap:      ${SWAP_G}GiB"
-_tty_echo " TZ:        $TZ"
-_tty_echo " Locale:    $LOCALE"
-_tty_echo " Keymap:    $KEYMAP"
-_tty_echo " Hostname:  $HOSTNAME"
-_tty_echo " User:      $USERNAME"
-_tty_echo " Log:       $LOG_FILE"
+_ui_kv "Disk:" "$DISK"
+_ui_kv "FS:" "$FS"
+_ui_kv "Swap:" "${SWAP_G}GiB"
+_ui_kv "TZ:" "$TZ"
+_ui_kv "Locale:" "$LOCALE"
+_ui_kv "Keymap:" "$KEYMAP"
+_ui_kv "Hostname:" "$HOSTNAME"
+_ui_kv "User:" "$USERNAME"
+_ui_kv "Log:" "$LOG_FILE"
 _tty_echo ""
 ui_yesno "Proceed?" || die "Aborted"
 
 # ---- Partition / format ----
-ui_msg "Partitioning + formatting…"
-
+_ui_title
+_ui_step "2/7" "Partitioning + formatting"
 umount -R "$MNT" >/dev/null 2>&1 || true
 swapoff -a >/dev/null 2>&1 || true
 _unmount_disk_everything "$DISK"
@@ -406,10 +433,11 @@ if [[ "$FS" == "btrfs" ]]; then
   mount -o subvol=@home "$ROOT_PART" "$MNT/home"
   mount "$EFI_PART" "$MNT/boot"
 fi
+_ui_ok "Disk prepared"
 
 # ---- Pacstrap base ----
-ui_msg "Installing base system (repo packages)…"
-
+_ui_title
+_ui_step "3/7" "Installing base system (repo packages)"
 BASE_PKGS=(
   base linux linux-firmware
   sudo git curl jq
@@ -424,9 +452,11 @@ BASE_PKGS=(
 
 pacstrap -K "$MNT" "${BASE_PKGS[@]}"
 genfstab -U "$MNT" > "$MNT/etc/fstab"
+_ui_ok "Base installed + fstab generated"
 
 # Swapfile
 if [[ "$SWAP_G" != "0" ]]; then
+  _ui_step "4/7" "Creating swapfile"
   if [[ "$FS" == "ext4" ]]; then
     fallocate -l "${SWAP_G}G" "$MNT/swapfile"
     chmod 600 "$MNT/swapfile"
@@ -440,13 +470,17 @@ if [[ "$SWAP_G" != "0" ]]; then
     mkswap "$MNT/swap/swapfile"
     echo "/swap/swapfile none swap defaults 0 0" >> "$MNT/etc/fstab"
   fi
+  _ui_ok "Swapfile ready"
 fi
 
 # ---- Fetch firstboot now so it's embedded ----
+_ui_title
+_ui_step "5/7" "Embedding firstboot + enabling service"
 FIRSTBOOT_URL="${FIRSTBOOT_URL:-https://raw.githubusercontent.com/DrapNard/DrapBox/refs/heads/main/firstboot.sh}"
 mkdir -p "$MNT/usr/lib/drapbox"
 curl -fsSL "$FIRSTBOOT_URL" -o "$MNT/usr/lib/drapbox/firstboot.sh"
 chmod 0755 "$MNT/usr/lib/drapbox/firstboot.sh"
+_ui_ok "firstboot.sh installed"
 
 cat >"$MNT/etc/systemd/system/drapbox-firstboot.service" <<'EOF'
 [Unit]
@@ -462,8 +496,11 @@ RemainAfterExit=yes
 [Install]
 WantedBy=multi-user.target
 EOF
+_ui_ok "firstboot systemd unit written"
 
 # ---- Chroot config (incl. repo paru, fallback aur paru) ----
+_ui_title
+_ui_step "6/7" "Configuring installed system (chroot)"
 cat >"$MNT/root/drapbox-chroot.sh" <<'CHROOT'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -521,36 +558,24 @@ EOF
 
 # --- IMPORTANT: full sync so pacman/libalpm consistent ---
 echo "[chroot] fixing pacman keyring (PGP)..."
-
-# make sure time is ok (signatures can fail if clock is wrong)
 timedatectl set-ntp true >/dev/null 2>&1 || true
 
-# hard reset keyring state (safe in fresh install)
 rm -rf /etc/pacman.d/gnupg
 pacman-key --init
 pacman-key --populate archlinux
-
-# remove possibly corrupted cached keyring packages
 rm -f /var/cache/pacman/pkg/archlinux-keyring-*.pkg.tar.* 2>/dev/null || true
 
-# resync DB and reinstall keyring
 pacman -Syy --noconfirm
 pacman -S --noconfirm --needed archlinux-keyring
-
-# if still failing, refresh keys (slow but fixes “unknown trust” cases)
-# pacman-key --refresh-keys || true
-
-# now upgrade
 pacman -Syu --noconfirm
 
-# Try install yay from repo first (best, no libalpm mismatch)
+# Try install yay from repo first
 if pacman -S --noconfirm --needed yay; then
   echo "[chroot] yay installed from repo."
 else
   echo "[chroot] yay not in repo -> building from AUR (source) ..."
   pacman -S --noconfirm --needed git base-devel
 
-  # allow pacman without password only during build
   echo '%wheel ALL=(ALL:ALL) NOPASSWD: /usr/bin/pacman, /usr/bin/pacman-key' >/etc/sudoers.d/99-drapbox-pacman
   chmod 440 /etc/sudoers.d/99-drapbox-pacman
 
@@ -560,12 +585,11 @@ else
 
   su - "$USERNAME" -c "cd '$BUILD_DIR' && rm -rf yay-bin && git clone https://aur.archlinux.org/yay-bin.git"
   su - "$USERNAME" -c "cd '$BUILD_DIR/yay-bin' && makepkg -si --noconfirm --needed"
-  
 fi
 
 command -v yay >/dev/null 2>&1 || die "yay missing"
 
-# Install repo packages first, fallback to paru if missing
+# Install packages (repo -> yay)
 want_repo=(uxplay gnome-network-displays)
 for p in "${want_repo[@]}"; do
   if pacman -S --noconfirm --needed "$p"; then
@@ -584,6 +608,7 @@ CHROOT
 chmod +x "$MNT/root/drapbox-chroot.sh"
 arch-chroot "$MNT" /root/drapbox-chroot.sh \
   "$HOSTNAME" "$USERNAME" "$USERPASS" "$ROOTPASS" "$TZ" "$LOCALE" "$KEYMAP" "$FS"
+_ui_ok "Chroot configuration complete"
 
 echo
 echo "✅ Install complete."
@@ -592,10 +617,29 @@ echo
 
 umount -R "$MNT" >/dev/null 2>&1 || true
 
+# =============================================================================
+# Post-install UX (CLI only) - DOES NOT CHANGE LOGIC
+# Adds a clear “firstboot will run after reboot” notice
+# =============================================================================
+_ui_title
+_ui_step "7/7" "Finish"
+_tty_echo ""
+_tty_echo "Next boot:"
+_tty_echo "  • DrapBox will start normally"
+_tty_echo "  • firstboot will auto-run once via: drapbox-firstboot.service"
+_tty_echo ""
+_tty_echo "Tip: If firstboot doesn't show, check:"
+_tty_echo "  systemctl status drapbox-firstboot.service"
+_tty_echo ""
+
 if [[ "${AUTO_REBOOT:-yes}" == "yes" ]]; then
-  ui_msg "Install complete ✅\n\nRebooting now…"
+  _tty_echo "Rebooting now…"
+  _ui_line
   reboot
 else
-  ui_msg "Install complete ✅\n\nAuto-reboot disabled.\n\nLog: $LOG_FILE\n\nDropping to shell."
+  _tty_echo "Auto-reboot disabled."
+  _tty_echo "Log: $LOG_FILE"
+  _tty_echo "Dropping to shell."
+  _ui_line
   bash
 fi
