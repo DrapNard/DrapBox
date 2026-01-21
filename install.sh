@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-APP="DrapBox Installer v5 (CLI Live + AUR via paru)"
+APP="DrapBox Installer v6"
 MNT=/mnt
 
 die(){ echo "✗ $*" >&2; exit 1; }
