@@ -573,7 +573,7 @@ for p in "${want_repo[@]}"; do
     echo "[chroot] repo ok: $p"
   else
     echo "[chroot] repo missing -> yay: $p"
-    su - "$USERNAME" -c "yay -S --noconfirm --needed --skipreview $p"
+    su - "$USERNAME" -c "yay -S --noconfirm --needed $p"
   fi
 done
 
