@@ -63,10 +63,25 @@ echo "Started: $(date -Is)"
 echo
 
 # =============================================================================
+# Error trap (so crashes always show the failing command + line)
+# =============================================================================
+on_err() {
+  local ec=$?
+  echo
+  echo "✗ ERROR: exit=$ec line=$LINENO"
+  echo "✗ CMD: $BASH_COMMAND"
+  echo "✗ LOG: $LOG_FILE"
+  echo
+  printf "\n✗ ERROR: exit=%s line=%s\n✗ CMD: %s\n✗ LOG: %s\n\n" \
+    "$ec" "$LINENO" "$BASH_COMMAND" "$LOG_FILE" >"$TTY_DEV" 2>/dev/null || true
+  exit "$ec"
+}
+trap on_err ERR
+
+# =============================================================================
 # Gum UI (fallback to plain if gum missing / PTY missing)
 # =============================================================================
 GUM=0
-
 pty_ok(){ [[ -c /dev/ptmx ]] && mountpoint -q /dev/pts; }
 
 if command -v gum >/dev/null 2>&1 && pty_ok; then
@@ -74,18 +89,13 @@ if command -v gum >/dev/null 2>&1 && pty_ok; then
 fi
 
 # IMPORTANT:
-# - The installer logs stdout+stderr via tee.
-# - gum draws TUI with ANSI escapes: we must NOT let that go into tee/log.
-# - Also, we must keep stdout free when we need to CAPTURE a value.
-#
-# gum_ui  : for pure UI commands (no captured output) -> send everything to real TTY
-# gum_val : for commands that return a value on stdout -> keep stdout, but force UI to TTY via stderr
+# - stdout+stderr are logged via tee.
+# - gum TUI must NOT pollute logs.
+# - commands must remain loggable -> NEVER run commands through gum.
 gum_ui(){ command gum "$@" </dev/tty >/dev/tty 2>/dev/tty; }
 gum_val(){ command gum "$@" </dev/tty 2>/dev/tty; }
 
-ui_clear(){
-  printf "\033c" >"$TTY_DEV" 2>/dev/null || true
-}
+ui_clear(){ printf "\033c" >"$TTY_DEV" 2>/dev/null || true; }
 
 ui_title(){
   local t="$1"
@@ -101,38 +111,26 @@ ui_title(){
 
 ui_info(){
   local msg="$1"
-  if (( GUM )); then
-    gum_ui style --margin "0 2" --faint "$msg"
-  else
-    _tty_echo "$msg"
-  fi
+  if (( GUM )); then gum_ui style --margin "0 2" --faint "$msg"
+  else _tty_echo "$msg"; fi
 }
 
 ui_warn(){
   local msg="$1"
-  if (( GUM )); then
-    gum_ui style --margin "0 2" --foreground 214 --bold "⚠ $msg"
-  else
-    _tty_echo "⚠ $msg"
-  fi
+  if (( GUM )); then gum_ui style --margin "0 2" --foreground 214 --bold "⚠ $msg"
+  else _tty_echo "⚠ $msg"; fi
 }
 
 ui_ok(){
   local msg="$1"
-  if (( GUM )); then
-    gum_ui style --margin "0 2" --foreground 42 --bold "✓ $msg"
-  else
-    _tty_echo "✓ $msg"
-  fi
+  if (( GUM )); then gum_ui style --margin "0 2" --foreground 42 --bold "✓ $msg"
+  else _tty_echo "✓ $msg"; fi
 }
 
 ui_err(){
   local msg="$1"
-  if (( GUM )); then
-    gum_ui style --margin "0 2" --foreground 196 --bold "✗ $msg"
-  else
-    _tty_echo "✗ $msg"
-  fi
+  if (( GUM )); then gum_ui style --margin "0 2" --foreground 196 --bold "✗ $msg"
+  else _tty_echo "✗ $msg"; fi
 }
 
 ui_yesno(){
@@ -165,10 +163,12 @@ ui_pass(){
   fi
 }
 
+# ---- NOTE: ui_spin prints UI via gum but runs command normally (logs stay intact) ----
 ui_spin(){
   local title="$1"; shift
   if (( GUM )); then
-    gum_ui spin --spinner dot --title "$title" -- "$@"
+    gum_ui style --margin "0 2" --faint "⏳ $title"
+    "$@"
   else
     ui_info "$title"
     "$@"
@@ -217,10 +217,8 @@ enter_ramroot_overlay() {
     -o "lowerdir=/run/drapbox-ramroot/lower,upperdir=/run/drapbox-ramroot/tmp/upper,workdir=/run/drapbox-ramroot/tmp/work" \
     /run/drapbox-ramroot/merged
 
-  # --- IMPORTANT: use rbind so /dev/pts + /dev/ptmx survive (gum needs PTY) ---
-  for d in proc sys dev run tmp; do
-    mkdir -p "/run/drapbox-ramroot/merged/$d"
-  done
+  # --- IMPORTANT: rbind so /dev/pts + /dev/ptmx exist (gum needs PTY) ---
+  for d in proc sys dev run tmp; do mkdir -p "/run/drapbox-ramroot/merged/$d"; done
 
   mount --rbind /proc /run/drapbox-ramroot/merged/proc
   mount --rbind /sys  /run/drapbox-ramroot/merged/sys
@@ -228,14 +226,13 @@ enter_ramroot_overlay() {
   mount --rbind /run  /run/drapbox-ramroot/merged/run
   mount --rbind /tmp  /run/drapbox-ramroot/merged/tmp
 
-  # avoid mount propagation surprises
   mount --make-rslave /run/drapbox-ramroot/merged/proc || true
   mount --make-rslave /run/drapbox-ramroot/merged/sys  || true
   mount --make-rslave /run/drapbox-ramroot/merged/dev  || true
   mount --make-rslave /run/drapbox-ramroot/merged/run  || true
   mount --make-rslave /run/drapbox-ramroot/merged/tmp  || true
 
-  # belt & suspenders: ensure devpts + shm exist inside merged root
+  # Belt & suspenders: devpts + shm inside merged root
   mkdir -p /run/drapbox-ramroot/merged/dev/pts /run/drapbox-ramroot/merged/dev/shm
   mountpoint -q /run/drapbox-ramroot/merged/dev/pts || \
     mount -t devpts devpts /run/drapbox-ramroot/merged/dev/pts -o gid=5,mode=620
@@ -244,7 +241,6 @@ enter_ramroot_overlay() {
 
   install -m 0755 "$SELF" /run/drapbox-ramroot/merged/tmp/drapbox-run
   export IN_RAMROOT=1 LOG_FILE LOG_DIR SCRIPT_URL SELF TERM
-
   exec chroot /run/drapbox-ramroot/merged /tmp/drapbox-run
 }
 
@@ -304,9 +300,7 @@ _unmount_disk_everything(){
   for p in "${parts[@]}"; do
     local mps
     mapfile -t mps < <(lsblk -lnpo MOUNTPOINT "$p" 2>/dev/null | awk 'NF{print}')
-    for mp in "${mps[@]}"; do
-      umount -R "$mp" >/dev/null 2>&1 || true
-    done
+    for mp in "${mps[@]}"; do umount -R "$mp" >/dev/null 2>&1 || true; done
     swapoff "$p" >/dev/null 2>&1 || true
   done
 }
@@ -458,8 +452,8 @@ ui_title "Bootstrap"
 maybe_use_ramroot
 fix_system_after_overlay
 
-# Keyring baseline
-ui_spin "Refreshing keyring (live)..." pacman -Sy --noconfirm --needed archlinux-keyring >/dev/null 2>&1 || true
+# Keyring baseline (don’t hide errors: logs matter)
+ui_spin "Refreshing keyring (live)..." pacman -Sy --noconfirm --needed archlinux-keyring
 pacman-key --populate archlinux >/dev/null 2>&1 || true
 
 # Live deps (+ gum)
@@ -468,15 +462,10 @@ ui_spin "Installing live dependencies (incl. gum)..." pacman -Sy --noconfirm --n
   gptfdisk util-linux dosfstools e2fsprogs btrfs-progs \
   arch-install-scripts \
   curl git jq \
-  gum \
-  >/dev/null
+  gum
 
 # enable gum UI after install (only if PTY works)
-if command -v gum >/dev/null 2>&1 && pty_ok; then
-  GUM=1
-else
-  GUM=0
-fi
+if command -v gum >/dev/null 2>&1 && pty_ok; then GUM=1; else GUM=0; fi
 
 ui_title "Welcome"
 ui_info "This will install DrapBox on a selected disk."
@@ -526,11 +515,11 @@ ui_yesno "Proceed with WIPE + install?" || die "Aborted"
 
 # ---- Partition / format ----
 ui_title "Partitioning"
-ui_spin "Unmounting..." umount -R "$MNT" >/dev/null 2>&1 || true
+ui_spin "Unmounting..." umount -R "$MNT"
 swapoff -a >/dev/null 2>&1 || true
 _unmount_disk_everything "$DISK"
 
-ui_spin "Wiping signatures..." wipefs -af "$DISK" >/dev/null 2>&1 || true
+ui_spin "Wiping signatures..." wipefs -af "$DISK"
 
 ui_spin "Creating GPT..." sgdisk --zap-all "$DISK"
 sgdisk -o "$DISK"
@@ -538,7 +527,12 @@ sgdisk -n 1:0:+512MiB -t 1:ef00 -c 1:"EFI" "$DISK"
 sgdisk -n 2:0:0      -t 2:8300 -c 2:"ROOT" "$DISK"
 partprobe "$DISK" || true
 udevadm settle || true
-sleep 1
+
+# Wait for partitions to appear (VMs can lag)
+for i in {1..20}; do
+  [[ -b "${DISK}1" || -b "${DISK}p1" ]] && break
+  sleep 0.2
+done
 
 EFI_PART="${DISK}1"
 ROOT_PART="${DISK}2"
@@ -608,7 +602,7 @@ if [[ "$SWAP_G" != "0" ]]; then
   fi
 fi
 
-# ---- Fetch firstboot now so it's embedded ----
+# ---- Fetch firstboot ----
 ui_title "Firstboot"
 FIRSTBOOT_URL="${FIRSTBOOT_URL:-https://raw.githubusercontent.com/DrapNard/DrapBox/refs/heads/main/firstboot.sh}"
 mkdir -p "$MNT/usr/lib/drapbox"
