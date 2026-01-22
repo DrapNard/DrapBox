@@ -63,10 +63,15 @@ echo "Started: $(date -Is)"
 echo
 
 # =============================================================================
-# Gum UI (fallback to plain if gum missing)
+# Gum UI (fallback to plain if gum missing / PTY missing)
 # =============================================================================
 GUM=0
-if command -v gum >/dev/null 2>&1; then GUM=1; fi
+
+pty_ok(){ [[ -c /dev/ptmx ]] && mountpoint -q /dev/pts; }
+
+if command -v gum >/dev/null 2>&1 && pty_ok; then
+  GUM=1
+fi
 
 # IMPORTANT:
 # - The installer logs stdout+stderr via tee.
@@ -79,7 +84,6 @@ gum_ui(){ command gum "$@" </dev/tty >/dev/tty 2>/dev/tty; }
 gum_val(){ command gum "$@" </dev/tty 2>/dev/tty; }
 
 ui_clear(){
-  # gum's style looks better on clean screens
   printf "\033c" >"$TTY_DEV" 2>/dev/null || true
 }
 
@@ -213,15 +217,34 @@ enter_ramroot_overlay() {
     -o "lowerdir=/run/drapbox-ramroot/lower,upperdir=/run/drapbox-ramroot/tmp/upper,workdir=/run/drapbox-ramroot/tmp/work" \
     /run/drapbox-ramroot/merged
 
-  for d in proc sys dev run tmp; do mkdir -p "/run/drapbox-ramroot/merged/$d"; done
-  mount --bind /proc /run/drapbox-ramroot/merged/proc
-  mount --bind /sys  /run/drapbox-ramroot/merged/sys
-  mount --bind /dev  /run/drapbox-ramroot/merged/dev
-  mount --bind /run  /run/drapbox-ramroot/merged/run
-  mount --bind /tmp  /run/drapbox-ramroot/merged/tmp
+  # --- IMPORTANT: use rbind so /dev/pts + /dev/ptmx survive (gum needs PTY) ---
+  for d in proc sys dev run tmp; do
+    mkdir -p "/run/drapbox-ramroot/merged/$d"
+  done
+
+  mount --rbind /proc /run/drapbox-ramroot/merged/proc
+  mount --rbind /sys  /run/drapbox-ramroot/merged/sys
+  mount --rbind /dev  /run/drapbox-ramroot/merged/dev
+  mount --rbind /run  /run/drapbox-ramroot/merged/run
+  mount --rbind /tmp  /run/drapbox-ramroot/merged/tmp
+
+  # avoid mount propagation surprises
+  mount --make-rslave /run/drapbox-ramroot/merged/proc || true
+  mount --make-rslave /run/drapbox-ramroot/merged/sys  || true
+  mount --make-rslave /run/drapbox-ramroot/merged/dev  || true
+  mount --make-rslave /run/drapbox-ramroot/merged/run  || true
+  mount --make-rslave /run/drapbox-ramroot/merged/tmp  || true
+
+  # belt & suspenders: ensure devpts + shm exist inside merged root
+  mkdir -p /run/drapbox-ramroot/merged/dev/pts /run/drapbox-ramroot/merged/dev/shm
+  mountpoint -q /run/drapbox-ramroot/merged/dev/pts || \
+    mount -t devpts devpts /run/drapbox-ramroot/merged/dev/pts -o gid=5,mode=620
+  mountpoint -q /run/drapbox-ramroot/merged/dev/shm || \
+    mount -t tmpfs shm /run/drapbox-ramroot/merged/dev/shm -o mode=1777,nosuid,nodev
 
   install -m 0755 "$SELF" /run/drapbox-ramroot/merged/tmp/drapbox-run
   export IN_RAMROOT=1 LOG_FILE LOG_DIR SCRIPT_URL SELF TERM
+
   exec chroot /run/drapbox-ramroot/merged /tmp/drapbox-run
 }
 
@@ -272,7 +295,7 @@ fix_system_after_overlay() {
 }
 
 # =============================================================================
-# Disk picker (gum fixed: no TUI into logs, stdout capture works)
+# Disk picker
 # =============================================================================
 _unmount_disk_everything(){
   local disk="$1"
@@ -343,7 +366,7 @@ pick_disk(){
 }
 
 # =============================================================================
-# Network (gum fixed)
+# Network
 # =============================================================================
 is_online(){
   ping -c1 -W1 1.1.1.1 >/dev/null 2>&1 && return 0
@@ -448,8 +471,12 @@ ui_spin "Installing live dependencies (incl. gum)..." pacman -Sy --noconfirm --n
   gum \
   >/dev/null
 
-# enable gum UI after install
-if command -v gum >/dev/null 2>&1; then GUM=1; fi
+# enable gum UI after install (only if PTY works)
+if command -v gum >/dev/null 2>&1 && pty_ok; then
+  GUM=1
+else
+  GUM=0
+fi
 
 ui_title "Welcome"
 ui_info "This will install DrapBox on a selected disk."
@@ -564,7 +591,7 @@ BASE_PKGS=(
 ui_spin "pacstrap (repo packages)..." pacstrap -K "$MNT" "${BASE_PKGS[@]}"
 ui_spin "genfstab..." genfstab -U "$MNT" > "$MNT/etc/fstab"
 
-# Swapfile (unchanged)
+# Swapfile
 if [[ "$SWAP_G" != "0" ]]; then
   if [[ "$FS" == "ext4" ]]; then
     ui_spin "Creating swapfile..." fallocate -l "${SWAP_G}G" "$MNT/swapfile"
@@ -608,7 +635,7 @@ TTYVTDisallocate=yes
 WantedBy=multi-user.target
 EOF
 
-# ---- Chroot config (logic unchanged) ----
+# ---- Chroot config ----
 ui_title "Chroot configuration"
 cat >"$MNT/root/drapbox-chroot.sh" <<'CHROOT'
 #!/usr/bin/env bash
@@ -665,7 +692,7 @@ initrd /initramfs-linux.img
 options root=UUID=$ROOT_UUID rw $CMDLINE
 EOF
 
-# --- PGP / keyring recovery (unchanged) ---
+# --- PGP / keyring recovery ---
 echo "[chroot] fixing pacman keyring (PGP)..."
 timedatectl set-ntp true >/dev/null 2>&1 || true
 rm -rf /etc/pacman.d/gnupg
