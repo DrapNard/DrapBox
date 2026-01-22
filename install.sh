@@ -68,8 +68,15 @@ echo
 GUM=0
 if command -v gum >/dev/null 2>&1; then GUM=1; fi
 
-# Run gum fully attached to the real TTY (fixes weird stdin/pipe issues)
-gum_tty(){ command gum "$@" </dev/tty >/dev/tty; }
+# IMPORTANT:
+# - The installer logs stdout+stderr via tee.
+# - gum draws TUI with ANSI escapes: we must NOT let that go into tee/log.
+# - Also, we must keep stdout free when we need to CAPTURE a value.
+#
+# gum_ui  : for pure UI commands (no captured output) -> send everything to real TTY
+# gum_val : for commands that return a value on stdout -> keep stdout, but force UI to TTY via stderr
+gum_ui(){ command gum "$@" </dev/tty >/dev/tty 2>/dev/tty; }
+gum_val(){ command gum "$@" </dev/tty 2>/dev/tty; }
 
 ui_clear(){
   # gum's style looks better on clean screens
@@ -80,7 +87,7 @@ ui_title(){
   local t="$1"
   if (( GUM )); then
     ui_clear
-    gum_tty style --border double --padding "1 2" --margin "1 2" --bold "$APP" "$t" "Log: $LOG_FILE"
+    gum_ui style --border double --padding "1 2" --margin "1 2" --bold "$APP" "$t" "Log: $LOG_FILE"
   else
     ui_clear
     _tty_echo "== $APP == $t"
@@ -91,7 +98,7 @@ ui_title(){
 ui_info(){
   local msg="$1"
   if (( GUM )); then
-    gum_tty style --margin "0 2" --faint "$msg"
+    gum_ui style --margin "0 2" --faint "$msg"
   else
     _tty_echo "$msg"
   fi
@@ -100,7 +107,7 @@ ui_info(){
 ui_warn(){
   local msg="$1"
   if (( GUM )); then
-    gum_tty style --margin "0 2" --foreground 214 --bold "⚠ $msg"
+    gum_ui style --margin "0 2" --foreground 214 --bold "⚠ $msg"
   else
     _tty_echo "⚠ $msg"
   fi
@@ -109,7 +116,7 @@ ui_warn(){
 ui_ok(){
   local msg="$1"
   if (( GUM )); then
-    gum_tty style --margin "0 2" --foreground 42 --bold "✓ $msg"
+    gum_ui style --margin "0 2" --foreground 42 --bold "✓ $msg"
   else
     _tty_echo "✓ $msg"
   fi
@@ -118,7 +125,7 @@ ui_ok(){
 ui_err(){
   local msg="$1"
   if (( GUM )); then
-    gum_tty style --margin "0 2" --foreground 196 --bold "✗ $msg"
+    gum_ui style --margin "0 2" --foreground 196 --bold "✗ $msg"
   else
     _tty_echo "✗ $msg"
   fi
@@ -127,7 +134,7 @@ ui_err(){
 ui_yesno(){
   local q="$1"
   if (( GUM )); then
-    gum_tty confirm "$q"
+    gum_ui confirm "$q"
   else
     local ans
     ans="$(_tty_readline "$q [y/N]: " "")"
@@ -138,7 +145,7 @@ ui_yesno(){
 ui_input(){
   local prompt="$1" def="${2:-}"
   if (( GUM )); then
-    gum_tty input --prompt "$prompt " --value "$def"
+    gum_val input --prompt "$prompt " --value "$def"
   else
     _tty_readline "$prompt [$def]: " "$def"
   fi
@@ -147,7 +154,7 @@ ui_input(){
 ui_pass(){
   local prompt="$1"
   if (( GUM )); then
-    gum_tty input --password --prompt "$prompt "
+    gum_val input --password --prompt "$prompt "
   else
     ui_warn "Password input is visible in pure CLI fallback."
     _tty_readline "$prompt: " ""
@@ -157,7 +164,7 @@ ui_pass(){
 ui_spin(){
   local title="$1"; shift
   if (( GUM )); then
-    gum_tty spin --spinner dot --title "$title" -- "$@"
+    gum_ui spin --spinner dot --title "$title" -- "$@"
   else
     ui_info "$title"
     "$@"
@@ -265,7 +272,7 @@ fix_system_after_overlay() {
 }
 
 # =============================================================================
-# Disk picker (same logic, fixed gum choose feeding)
+# Disk picker (gum fixed: no TUI into logs, stdout capture works)
 # =============================================================================
 _unmount_disk_everything(){
   local disk="$1"
@@ -304,8 +311,7 @@ pick_disk(){
 
     local chosen_line=""
     if (( GUM )); then
-      # IMPORTANT: pass options as args, NOT via pipe (gum stdin is /dev/tty here)
-      chosen_line="$(gum_tty choose --height 12 --header "Select target disk" "${disks[@]}")" || true
+      chosen_line="$(gum_val choose --height 12 --header "Select target disk" "${disks[@]}")" || true
     else
       _tty_echo ""
       local i=0
@@ -337,7 +343,7 @@ pick_disk(){
 }
 
 # =============================================================================
-# Network (logic unchanged, fixed gum choose feeding)
+# Network (gum fixed)
 # =============================================================================
 is_online(){
   ping -c1 -W1 1.1.1.1 >/dev/null 2>&1 && return 0
@@ -355,7 +361,7 @@ ensure_network(){
 
     if (( GUM )); then
       local act
-      act="$(gum_tty choose --height 8 --header "Choose action" \
+      act="$(gum_val choose --height 8 --header "Choose action" \
         "Retry" \
         "Wi-Fi (iwctl)" \
         "Shell" \
@@ -475,7 +481,7 @@ ui_yesno "Auto reboot after install?" || AUTO_REBOOT="no"
 
 ui_title "Summary"
 if (( GUM )); then
-  gum_tty style --border normal --padding "1 2" --margin "1 2" \
+  gum_ui style --border normal --padding "1 2" --margin "1 2" \
 "Disk:      $DISK
 FS:        $FS
 Swap:      ${SWAP_G}GiB
