@@ -515,8 +515,6 @@ ui_yesno "Proceed with WIPE + install?" || die "Aborted"
 
 # ---- Partition / format ----
 ui_title "Partitioning"
-ui_spin "Unmounting..." umount -R "$MNT"
-swapoff -a >/dev/null 2>&1 || true
 _unmount_disk_everything "$DISK"
 
 ui_spin "Wiping signatures..." wipefs -af "$DISK"
