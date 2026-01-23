@@ -515,7 +515,7 @@ ui_yesno "Proceed with WIPE + install?" || die "Aborted"
 
 # ---- Partition / format ----
 ui_title "Partitioning"
-_unmount_disk_everything "$DISK"
+ui_spin "Umount disk" _unmount_disk_everything "$DISK"
 
 ui_spin "Wiping signatures..." wipefs -af "$DISK"
 
