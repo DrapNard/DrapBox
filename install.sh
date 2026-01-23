@@ -360,6 +360,140 @@ pick_disk(){
 }
 
 # =============================================================================
+# Locale + keymap pickers
+# =============================================================================
+
+pick_from_list() {
+  # usage: pick_from_list "Title" default "item1" "item2" ...
+  local title="$1"; shift
+  local def="$1"; shift
+  local items=("$@")
+  local chosen=""
+
+  ((${#items[@]})) || { echo "$def"; return 0; }
+
+  if (( GUM )); then
+    chosen="$(gum_val choose --height 14 --header "$title" "${items[@]}")" || true
+  else
+    _tty_echo ""
+    _tty_echo "== $title =="
+    local i=0
+    for it in "${items[@]}"; do
+      i=$((i+1))
+      printf "%2d) %s\n" "$i" "$it" >"$TTY_DEV"
+    done
+    local n
+    n="$(_tty_readline "Select [1-$i] (default: $def): " "")"
+    if [[ -z "$n" ]]; then
+      chosen="$def"
+    elif [[ "$n" =~ ^[0-9]+$ ]] && (( n>=1 && n<=i )); then
+      chosen="${items[$((n-1))]}"
+    else
+      chosen="$def"
+    fi
+  fi
+
+  [[ -n "$chosen" ]] && echo "$chosen" || echo "$def"
+}
+
+pick_locale() {
+  local def="${1:-en_US.UTF-8}"
+  local locales=()
+
+  # Best source on Arch: /usr/share/i18n/SUPPORTED contains full locale names
+  if [[ -r /usr/share/i18n/SUPPORTED ]]; then
+    mapfile -t locales < <(
+      awk '{print $1}' /usr/share/i18n/SUPPORTED 2>/dev/null |
+      grep -E 'UTF-8$' |
+      sort -u
+    )
+  fi
+
+  # Fallback if file missing
+  if ((${#locales[@]}==0)); then
+    locales=(en_US.UTF-8 fr_FR.UTF-8 de_DE.UTF-8 es_ES.UTF-8 it_IT.UTF-8)
+  fi
+
+  # Keep list reasonable: prioritize common ones first (optional)
+  local common=(en_US.UTF-8 fr_FR.UTF-8 en_GB.UTF-8 de_DE.UTF-8 es_ES.UTF-8 it_IT.UTF-8 pt_BR.UTF-8)
+  local merged=()
+  for c in "${common[@]}"; do
+    if printf '%s\n' "${locales[@]}" | grep -qx "$c"; then merged+=("$c"); fi
+  done
+  for l in "${locales[@]}"; do
+    # avoid duplicates
+    printf '%s\n' "${merged[@]}" | grep -qx "$l" || merged+=("$l")
+  done
+
+  pick_from_list "Select locale" "$def" "${merged[@]}"
+}
+
+pick_keymap() {
+  local def="${1:-us}"
+  local kms=()
+
+  if command -v localectl >/dev/null 2>&1; then
+    mapfile -t kms < <(localectl list-keymaps 2>/dev/null | sed '/^\s*$/d')
+  fi
+
+  if ((${#kms[@]}==0)) && [[ -d /usr/share/kbd/keymaps ]]; then
+    mapfile -t kms < <(
+      find /usr/share/kbd/keymaps -type f -name '*.map.gz' 2>/dev/null |
+      sed -E 's|.*/||; s|\.map\.gz$||' |
+      sort -u
+    )
+  fi
+
+  if ((${#kms[@]}==0)); then
+    kms=(us fr fr-latin1 uk de es it)
+  fi
+
+  pick_from_list "Select keyboard layout (keymap)" "$def" "${kms[@]}"
+}
+
+# =============================================================================
+# Timezone picker
+# =============================================================================
+
+pick_timezone() {
+  local def="${1:-Europe/Paris}"
+  local zoneinfo="/usr/share/zoneinfo"
+
+  [[ -d "$zoneinfo" ]] || { echo "$def"; return 0; }
+
+  # List regions (continents)
+  local regions=()
+  mapfile -t regions < <(
+    find "$zoneinfo" -mindepth 1 -maxdepth 1 -type d 2>/dev/null |
+    sed 's|.*/||' |
+    grep -Ev '^(posix|right|Etc)$' |
+    sort
+  )
+
+  ((${#regions[@]})) || { echo "$def"; return 0; }
+
+  local region
+  region="$(pick_from_list "Select timezone region" "${def%%/*}" "${regions[@]}")"
+  [[ -n "$region" ]] || { echo "$def"; return 0; }
+
+  # List cities inside region
+  local cities=()
+  mapfile -t cities < <(
+    find "$zoneinfo/$region" -type f 2>/dev/null |
+    sed "s|$zoneinfo/$region/||" |
+    sort
+  )
+
+  ((${#cities[@]})) || { echo "$region"; return 0; }
+
+  local city
+  city="$(pick_from_list "Select city ($region)" "${def#*/}" "${cities[@]}")"
+
+  echo "$region/$city"
+}
+
+
+# =============================================================================
 # Network
 # =============================================================================
 is_online(){
@@ -482,9 +616,9 @@ USERNAME="$(ui_input "Admin user (sudo):" "drapnard")"
 USERPASS="$(ui_pass "Password for user '$USERNAME':")"
 ROOTPASS="$(ui_pass "Password for root:")"
 
-TZ="$(ui_input "Timezone:" "Europe/Paris")"
-LOCALE="$(ui_input "Locale:" "en_US.UTF-8")"
-KEYMAP="$(ui_input "Keymap:" "us")"
+TZ="$(pick_timezone "Europe/Paris")"
+LOCALE="$(pick_locale "en_US.UTF-8")"
+KEYMAP="$(pick_keymap "us")"
 
 FS="$(ui_input "Root FS (ext4/btrfs):" "ext4")"
 [[ "$FS" == "ext4" || "$FS" == "btrfs" ]] || die "Invalid FS: $FS"
