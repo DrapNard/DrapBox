@@ -9,8 +9,7 @@ It provides:
 - Minimal Wayland environment (no traditional desktop)
 - Fullscreen, TV-like UX
 
-This project is currently in **beta** and uses a **single large installer script**.  
-A more modular, repo-based system is planned for later versions.
+This project is currently in **beta** and uses a **modular, repo-based installer**.
 
 ---
 
@@ -89,18 +88,29 @@ The installer will guide you through:
 
 ---
 
+## 🔄 Updates (without reinstall)
+
+The installed system keeps its scripts in `/usr/lib/drapbox`.  
+To refresh them later without re-imaging the machine:
+
+```bash
+sudo drapbox-update
+```
+
+This fetches the latest repo scripts (firstboot + chroot helpers).
+
 ## 🧪 Project status
 
 * **Status:** Beta
-* **Installer:** Monolithic script (for now)
+* **Installer:** Modular scripts (split into installer + firstboot modules)
 * **Target use:** Personal / experimental / appliance builds
 * **Stability:** Good, but expect rough edges
 
-Future versions will move toward:
+Current layout includes:
 
-* a modular repo-based architecture
-* easier updates
-* safer maintenance
+* `installer/` — modular installer flow + chroot config
+* `firstboot/` — firstboot wizard and overlay menu modules
+* `scripts/` — maintenance helpers (e.g., update)
 
 ---
 

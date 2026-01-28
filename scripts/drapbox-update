@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+DRAPBOX_REPO="${DRAPBOX_REPO:-DrapNard/DrapBox}"
+DRAPBOX_REF="${DRAPBOX_REF:-refs/heads/main}"
+DRAPBOX_TARBALL_URL="${DRAPBOX_TARBALL_URL:-https://codeload.github.com/${DRAPBOX_REPO}/tar.gz/${DRAPBOX_REF}}"
+
+DEST="/usr/lib/drapbox"
+
+TMP_DIR="$(mktemp -d)"
+cleanup(){ rm -rf "$TMP_DIR"; }
+trap cleanup EXIT
+
+curl -fsSL "$DRAPBOX_TARBALL_URL" -o "$TMP_DIR/drapbox.tar.gz"
+mkdir -p "$TMP_DIR/repo"
+tar -xzf "$TMP_DIR/drapbox.tar.gz" -C "$TMP_DIR/repo" --strip-components=1
+
+install -d "$DEST"
+rm -rf "$DEST/firstboot" "$DEST/chroot"
+cp -a "$TMP_DIR/repo/firstboot" "$DEST/"
+cp -a "$TMP_DIR/repo/installer/chroot" "$DEST/"
+
+install -m 0755 "$TMP_DIR/repo/scripts/drapbox-update" /usr/bin/drapbox-update
+
+echo "✓ DrapBox scripts updated in $DEST"
