@@ -73,7 +73,6 @@ Log:       $LOG_FILE"
 
   ui_title "Partitioning"
   ui_spin "Umount disk" _unmount_disk_everything "$DISK"
-  ui_spin "Wiping signatures..." wipefs -af "$DISK"
 
   ui_spin "Creating GPT..." sgdisk --zap-all "$DISK"
   sgdisk -o "$DISK"
