@@ -6,6 +6,11 @@ GUM=0
 pty_ok(){ [[ -c /dev/ptmx ]] && mountpoint -q /dev/pts; }
 
 ui_init(){
+  if [[ "${DRAPBOX_NO_GUM:-0}" == "1" ]]; then
+    GUM=0
+    return 0
+  fi
+
   if command -v gum >/dev/null 2>&1 && pty_ok; then
     GUM=1
   else

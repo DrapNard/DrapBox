@@ -18,6 +18,8 @@ pick_disk(){
     ui_title "Disk selection"
     ui_info "Target disk will be WIPED."
 
+    udevadm settle || true
+
     mapfile -t disks < <(
       lsblk -dn -o NAME,TYPE,SIZE,MODEL -P |
       awk '
@@ -53,11 +55,23 @@ pick_disk(){
       chosen_line="${disks[$((choice-1))]}"
     fi
 
-    [[ -n "$chosen_line" ]] || continue
+    [[ -n "$chosen_line" ]] || {
+      if (( GUM )); then
+        ui_warn "No selection from gum; falling back to text mode."
+        GUM=0
+      fi
+      continue
+    }
 
     local d
     d="$(awk '{print $1}' <<<"$chosen_line")"
-    [[ -b "$d" ]] || continue
+    if [[ ! -b "$d" ]]; then
+      if (( GUM )); then
+        ui_warn "Disk $d not found. Falling back to text mode."
+        GUM=0
+      fi
+      continue
+    fi
 
     ui_clear
     lsblk "$d" || true

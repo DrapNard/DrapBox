@@ -72,7 +72,15 @@ Log:       $LOG_FILE"
   ui_yesno "Proceed with WIPE + install?" || die "Aborted"
 
   ui_title "Partitioning"
+  for i in {1..10}; do
+    [[ -b "$DISK" ]] && break
+    udevadm settle || true
+    sleep 0.2
+  done
+  [[ -b "$DISK" ]] || die "Disk disappeared: $DISK"
+
   ui_spin "Umount disk" _unmount_disk_everything "$DISK"
+  ui_spin "Wiping signatures..." wipefs -af "$DISK"
 
   ui_spin "Creating GPT..." sgdisk --zap-all "$DISK"
   sgdisk -o "$DISK"
